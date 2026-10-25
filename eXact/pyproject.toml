@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exact"
+version = "0.1.0"
+description = "eXact — eXtensible Accurate Color Toolkit: a binary-preserving pixel editor for PNG"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "AGPL-3.0-only" }
+dependencies = [
+    "PyQt6>=6.5",
+    "Pillow>=10.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "psutil>=5.9"]
+
+[project.scripts]
+exact-cli = "exact.cli:main"
+
+[project.gui-scripts]
+exact = "exact.gui.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = ["slow: full-size (7488×7487) image tests; run with --runslow"]
