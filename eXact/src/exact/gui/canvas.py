@@ -12,12 +12,12 @@ import threading
 from collections import OrderedDict
 
 import numpy as np
-from PyQt6.QtCore import QLineF, QPointF, QRectF, Qt, pyqtSignal
+from PyQt6.QtCore import QLineF, QPointF, QRectF, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QCursor, QImage, QPainter, QPen
 from PyQt6.QtWidgets import QAbstractScrollArea
 
 from ..core.document import Clip, Document, Rect
-from . import display
+from . import display, style
 
 ZOOM_LEVELS = [0.125, 0.25, 0.5, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32]
 GRID_MIN_ZOOM = 4
@@ -170,7 +170,6 @@ class PixelView(QAbstractScrollArea):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.horizontalScrollBar().setSingleStep(24)
         self.verticalScrollBar().setSingleStep(24)
-        self._background = QColor(48, 48, 52)
 
 
     def set_source(self, source, *, keep_view: bool = False) -> None:
@@ -365,8 +364,9 @@ class PixelView(QAbstractScrollArea):
     def paintEvent(self, event) -> None:
         painter = QPainter(self.viewport())
         clip = event.rect()
-        painter.fillRect(clip, self._background)
+        painter.fillRect(clip, style.color("canvas"))
         if self.source is None:
+            self.paint_empty(painter)
             painter.end()
             return
         w, h = self.image_size()
@@ -412,8 +412,13 @@ class PixelView(QAbstractScrollArea):
             image = image.copy()  # rendered during a concurrent change: use once, don't cache
         return image
 
+    def paint_empty(self, painter: QPainter) -> None:
+        """Shown when there is no image; subclasses add a call to action."""
+
     def _paint_grid(self, painter: QPainter, x0: int, y0: int, x1: int, y1: int) -> None:
-        pen = QPen(QColor(128, 128, 128, 140))
+        line = QColor(style.tokens()["canvas"])
+        line.setAlpha(150)
+        pen = QPen(line)
         pen.setCosmetic(True)
         pen.setWidth(0)
         painter.setPen(pen)
@@ -455,7 +460,7 @@ class EditorCanvas(PixelView):
     pasteCommitted = pyqtSignal(int, int)
     pasteCancelled = pyqtSignal()
 
-    TOOLS = ("inspect", "pencil", "select", "hand")
+    TOOLS = ("inspect", "pencil", "eyedropper", "select", "hand", "zoom")
 
     def __init__(self, tool_settings, parent=None):
         super().__init__(parent)
@@ -486,6 +491,7 @@ class EditorCanvas(PixelView):
         if old and self.doc_source:
             self.doc_source.display_mode = old.display_mode
         self.set_source(self.doc_source)
+        self._restore_cursor()
 
     def set_tool(self, tool: str) -> None:
         self.tool = tool
@@ -495,9 +501,14 @@ class EditorCanvas(PixelView):
         shapes = {
             "inspect": Qt.CursorShape.CrossCursor,
             "pencil": Qt.CursorShape.CrossCursor,
+            "eyedropper": Qt.CursorShape.PointingHandCursor,
             "select": Qt.CursorShape.CrossCursor,
             "hand": Qt.CursorShape.OpenHandCursor,
+            "zoom": Qt.CursorShape.SizeAllCursor,
         }
+        if self.doc is None:
+            self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+            return
         self.viewport().setCursor(QCursor(shapes.get(self.tool, Qt.CursorShape.ArrowCursor)))
 
     def set_selection(self, rect: Rect | None) -> None:
@@ -559,6 +570,13 @@ class EditorCanvas(PixelView):
             return
         pixel = self.pixel_at(event.position())
         alt = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
+        if self.tool == "zoom":
+            (self.zoom_out if alt else self.zoom_in)(event.position())
+            return
+        if self.tool == "eyedropper":
+            if pixel:
+                self.colorPicked.emit(self.doc.get_pixel(*pixel))
+            return
         if self.tool == "pencil" and alt:
             if pixel:
                 self.colorPicked.emit(self.doc.get_pixel(*pixel))
@@ -592,10 +610,13 @@ class EditorCanvas(PixelView):
             x, y = self.pixel_at(event.position(), clamp=True)
             self.selection = Rect.from_points(*self._select_anchor, x, y)
             self.viewport().update()
-        elif self.tool == "inspect":
+        elif self.tool in ("inspect", "eyedropper"):
             pixel = self.pixel_at(event.position())
             if pixel:
-                self.pixelPicked.emit(*pixel)
+                if self.tool == "inspect":
+                    self.pixelPicked.emit(*pixel)
+                else:
+                    self.colorPicked.emit(self.doc.get_pixel(*pixel))
 
     def mouseReleaseEvent(self, event) -> None:
         if self._pan_last is not None:
@@ -610,13 +631,43 @@ class EditorCanvas(PixelView):
             self.selectionChanged.emit(self.selection)
 
 
+    def paint_empty(self, painter: QPainter) -> None:
+        t = style.tokens()
+        rect = self.viewport().rect()
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        box = QRectF(0, 0, min(460, rect.width() - 40), 236)
+        box.moveCenter(QPointF(rect.center()))
+        pen = QPen(QColor(t["border_strong"]), 1.5, Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(box, 12, 12)
+        logo = style.app_icon("logo-exact").pixmap(QSize(44, 44), self.devicePixelRatioF())
+        painter.drawPixmap(int(box.center().x() - 22), int(box.top() + 26), logo)
+        title = painter.font()
+        title.setPointSizeF(title.pointSizeF() * 1.35)
+        title.setWeight(title.Weight.DemiBold)
+        body = painter.font()
+        y = box.top() + 84
+        for text, font, color, height in (
+                ("Open a PNG to begin", title, t["text"], 30),
+                ("Drop a file here, or press Ctrl+O", body, t["text_muted"], 22),
+                ("8-bit RGB and RGBA only. Nothing is converted, premultiplied", body, t["text_faint"], 20),
+                ("or colour-managed; untouched bytes stay exactly as they are.", body, t["text_faint"], 20)):
+            painter.setFont(font)
+            painter.setPen(QColor(color))
+            painter.drawText(QRectF(box.left() + 10, y, box.width() - 20, height), Qt.AlignmentFlag.AlignCenter, text)
+            y += height + (8 if font is title else 0)
+        painter.restore()
+
     def paint_overlays(self, painter: QPainter) -> None:
         if self.doc is None:
             return
+        t = style.tokens()
         src = self.doc_source
         if src and src.compare == "split":
             top = self.image_to_view(src.split_x, 0)
-            pen = QPen(QColor(255, 200, 0))
+            pen = QPen(QColor(t["warning"]))
             pen.setWidth(2)
             pen.setCosmetic(True)
             painter.setPen(pen)
@@ -628,7 +679,7 @@ class EditorCanvas(PixelView):
             r = self.image_rect_to_view(Rect(x, y, 1, 1))
             if r.width() < 6:
                 r = r.adjusted(-3, -3, 3, 3)
-            pen = QPen(QColor(0, 255, 120))
+            pen = QPen(QColor(t["accent"]))
             pen.setCosmetic(True)
             pen.setWidth(2)
             painter.setPen(pen)

@@ -105,10 +105,16 @@ def test_refuses_unsupported_png_without_converting(window, tmp_path, monkeypatc
     path = str(tmp_path / "gray.png")
     Image.new("L", (4, 4)).save(path)
     shown = []
-    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *a, **k: shown.append(a[2]))
+    monkeypatch.setattr("exact.gui.main_window.show_error",
+                        lambda parent, exc, action="open", note="": shown.append((exc, note)))
     assert not window.open_path(path)
     assert window.doc is None
-    assert shown and "not opened" in shown[0]
+    assert shown and "not opened" in shown[0][1]
+    from exact.core.png_io import UnsupportedPngError
+    from exact.gui.errors import explain
+
+    assert isinstance(shown[0][0], UnsupportedPngError)
+    assert explain(shown[0][0]).title == "Unsupported PNG format"
 
 
 def test_tile_cache_invalidated_by_edits_undo_and_transforms(window, rgba_png):

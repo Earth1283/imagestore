@@ -98,6 +98,21 @@ class History:
         return self._redo[-1].label if self._redo else None
 
     @property
+    def undo_stack(self) -> tuple[Command, ...]:
+        """Applied commands, oldest first (read-only view for history displays)."""
+        return tuple(self._undo)
+
+    @property
+    def redo_stack(self) -> tuple[Command, ...]:
+        """Undone commands in the order redo would re-apply them."""
+        return tuple(reversed(self._redo))
+
+    @property
+    def base_state(self) -> int:
+        """State id of the buffer before the oldest command still in the stack."""
+        return self._base_state
+
+    @property
     def nbytes(self) -> int:
         return sum(c.nbytes for c in self._undo) + sum(c.nbytes for c in self._redo)
 

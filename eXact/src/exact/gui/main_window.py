@@ -1,13 +1,26 @@
-"""Main editor window."""
+"""Main editor window: a canvas-first workspace.
+
+    top     menu bar and one compact toolbar (file, history, zoom, view, workspace)
+    left    tool palette (inspect, pencil, eyedropper, select, hand, zoom, transforms)
+    centre  the canvas
+    right   Tool properties, Pixel inspector, History
+    bottom  Hex bytes, Integrity details, Image info (collapsible, tabbed)
+
+Two workspace presets (Edit, Inspect) arrange the docks; each remembers changes the user
+makes to it. Integrity is always visible in the status bar.
+"""
 
 from __future__ import annotations
 
 import os
 import threading
+import time
 
-from PyQt6.QtCore import QObject, QSettings, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QActionGroup, QKeySequence
+from PyQt6.QtCore import QObject, QSettings, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QActionGroup, QIcon, QKeySequence
 from PyQt6.QtWidgets import (
+    QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -15,12 +28,18 @@ from PyQt6.QtWidgets import (
     QDockWidget,
     QFileDialog,
     QFormLayout,
+    QFrame,
+    QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QSpinBox,
+    QToolBar,
+    QToolButton,
+    QWidget,
 )
 
 from .. import MOTTO, TAGLINE, __version__
@@ -28,12 +47,23 @@ from ..core import transforms
 from ..core.document import ChannelMismatchError, Clip, Document, OperationSummary, Rect
 from ..core.history import TransformCommand
 from ..core.pixels import pixel_offset
-from ..core.png_chunks import PngFormatError
-from ..core.png_io import SaveVerificationError, UnsupportedPngError
+from . import style
 from .canvas import ZOOM_LEVELS, EditorCanvas, zoom_label
 from .diff_dialog import DiffDialog
-from .display import DISPLAY_MODES
-from .panels import HexPanel, InfoPanel, InspectorPanel, IntegrityPanel, ToolOptions, ToolSettings, short_path
+from .errors import show_error
+from .hexview import HexPanel
+from .panels import (
+    HistoryPanel,
+    InfoPanel,
+    InspectorPanel,
+    IntegrityPanel,
+    ToolPanel,
+    ToolSettings,
+    integrity_state,
+    restyle_chips,
+    short_path,
+    swatch,
+)
 from .tasks import run_blocking
 
 HEAVY_PIXELS = 4_000_000
@@ -47,6 +77,8 @@ GUARANTEES_TEXT = """\
     transform restores the original buffer byte-for-byte.</li>
 <li>Every save is decoded again and compared byte-for-byte with the buffer before the
     original file is atomically replaced. If verification fails, the original is untouched.</li>
+<li>The canvas, hex view and inspector only display the buffer; what is saved always comes from
+    the authoritative pixel buffer, never from rendered tiles.</li>
 </ul>
 <h3>What it does not guarantee</h3>
 <ul>
@@ -59,8 +91,41 @@ GUARANTEES_TEXT = """\
 <p>Supported: 8-bit RGB and 8-bit RGBA PNG. Everything else is refused, never converted.</p>
 """
 
+TOOLS = (
+    ("inspect", "Inspect", "inspect", "I"),
+    ("pencil", "Pencil", "pencil", "P"),
+    ("eyedropper", "Eyedropper", "eyedropper", "E"),
+    ("select", "Rectangle Select", "select", "M"),
+    ("hand", "Hand", "hand", "H"),
+    ("zoom", "Zoom", "zoom", "Z"),
+)
+DISPLAY_CHOICES = (
+    ("composite", "Composite", "Composite over a checkerboard (alpha applied for display only)"),
+    ("rgb", "RGB, ignore alpha", "Raw RGB with alpha ignored: reveals data hidden under transparent pixels"),
+    ("alpha", "Alpha", "The alpha channel as greyscale"),
+    ("r", "Red", "The R channel as greyscale"),
+    ("g", "Green", "The G channel as greyscale"),
+    ("b", "Blue", "The B channel as greyscale"),
+)
+COMPARE_CHOICES = (("current", "Current", "eye"), ("original", "Original", "history"), ("split", "Split", "split"))
+DOCKS = (
+    ("tool", "Tool", Qt.DockWidgetArea.RightDockWidgetArea),
+    ("inspector", "Pixel", Qt.DockWidgetArea.RightDockWidgetArea),
+    ("history", "History", Qt.DockWidgetArea.RightDockWidgetArea),
+    ("hex", "Hex", Qt.DockWidgetArea.BottomDockWidgetArea),
+    ("integrity", "Integrity", Qt.DockWidgetArea.BottomDockWidgetArea),
+    ("info", "Image Info", Qt.DockWidgetArea.BottomDockWidgetArea),
+)
+WORKSPACES = {
+    "edit": ("Edit", "pencil", {"tool", "inspector", "history"}),
+    "inspect": ("Inspect", "verify", {"inspector", "hex", "integrity", "info"}),
+}
+
 
 class IntegrityWorker(QObject):
+    """Hashes the buffer on a background thread. The GUI debounces requests so a full-image
+    SHA-256 never runs per brush movement; results for a stale generation are discarded."""
+
     done = pyqtSignal(object, int, object)
 
     def __init__(self):
@@ -89,6 +154,63 @@ class IntegrityWorker(QObject):
         return True
 
 
+class Segmented(QFrame):
+    """Exclusive checkable buttons in one frame (view mode, workspace)."""
+
+    changed = pyqtSignal(str)
+
+    def __init__(self, items, *, text: bool = True, parent=None):
+        super().__init__(parent)
+        self.setProperty("role", "segmented")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(2, 2, 2, 2)
+        lay.setSpacing(2)
+        self.group = QButtonGroup(self)
+        self.buttons: dict[str, QToolButton] = {}
+        for key, label, icon, *tip in items:
+            b = QToolButton()
+            b.setIcon(style.icon(icon))
+            b.setText(label)
+            b.setToolTip(tip[0] if tip else label)
+            b.setAccessibleName(label)
+            b.setCheckable(True)
+            b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon if text
+                                 else Qt.ToolButtonStyle.ToolButtonIconOnly)
+            self.group.addButton(b)
+            self.buttons[key] = b
+            lay.addWidget(b)
+            b.toggled.connect(lambda on, k=key: on and self.changed.emit(k))
+        next(iter(self.buttons.values())).setChecked(True)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+    def value(self) -> str:
+        return next(k for k, b in self.buttons.items() if b.isChecked())
+
+    def set_value(self, key: str, *, emit: bool = True) -> None:
+        if not emit:
+            self.blockSignals(True)
+            for b in self.buttons.values():
+                b.blockSignals(True)
+        self.buttons[key].setChecked(True)
+        if not emit:
+            for b in self.buttons.values():
+                b.blockSignals(False)
+            self.blockSignals(False)
+
+    # QComboBox-like access, used by tests and older call sites
+    def count(self) -> int:
+        return len(self.buttons)
+
+    def setCurrentIndex(self, i: int) -> None:  # noqa: N802
+        list(self.buttons.values())[i].setChecked(True)
+
+    def findData(self, key: str) -> int:  # noqa: N802
+        return list(self.buttons).index(key) if key in self.buttons else -1
+
+    def currentData(self) -> str:  # noqa: N802
+        return self.value()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, settings: QSettings | None = None):
         super().__init__()
@@ -96,38 +218,47 @@ class MainWindow(QMainWindow):
         self.doc: Document | None = None
         self.clipboard: Clip | None = None
         self.hashes: dict | None = None
+        self.hashed_at: float | None = None
+        self.workspace: str | None = None
         self.tool_settings = ToolSettings()
-        self.resize(1400, 900)
+        self.setWindowIcon(style.app_icon("logo-exact"))
+        self.resize(1440, 900)
         self.setAcceptDrops(True)
+        self.setDockOptions(QMainWindow.DockOption.AnimatedDocks | QMainWindow.DockOption.AllowTabbedDocks
+                            | QMainWindow.DockOption.AllowNestedDocks)
+        self.setCorner(Qt.Corner.BottomRightCorner, Qt.DockWidgetArea.RightDockWidgetArea)
 
         self.canvas = EditorCanvas(self.tool_settings)
+        self.canvas.setFrameShape(QFrame.Shape.NoFrame)
         self.setCentralWidget(self.canvas)
+        self.tool_panel = ToolPanel(self.tool_settings)
+        self.tool_options = self.tool_panel  # older name
         self.inspector = InspectorPanel()
+        self.history_panel = HistoryPanel()
         self.hex_panel = HexPanel()
-        self.info_panel = InfoPanel()
         self.integrity_panel = IntegrityPanel()
-        self.docks = {}
-        for key, title, widget, area in (
-            ("inspector", "Pixel Inspector", self.inspector, Qt.DockWidgetArea.RightDockWidgetArea),
-            ("integrity", "Integrity", self.integrity_panel, Qt.DockWidgetArea.RightDockWidgetArea),
-            ("hex", "Hex Bytes", self.hex_panel, Qt.DockWidgetArea.BottomDockWidgetArea),
-            ("info", "Image Info", self.info_panel, Qt.DockWidgetArea.BottomDockWidgetArea),
-        ):
+        self.info_panel = InfoPanel()
+        widgets = {"tool": self.tool_panel, "inspector": self.inspector, "history": self.history_panel,
+                   "hex": self.hex_panel, "integrity": self.integrity_panel, "info": self.info_panel}
+        self.docks: dict[str, QDockWidget] = {}
+        for key, title, area in DOCKS:
             dock = QDockWidget(title, self)
             dock.setObjectName(key)
-            if area == Qt.DockWidgetArea.RightDockWidgetArea:
+            widget = widgets[key]
+            if key in ("tool", "inspector", "integrity"):
                 scroller = QScrollArea()
                 scroller.setWidgetResizable(True)
-                scroller.setFrameShape(QScrollArea.Shape.NoFrame)
+                scroller.setFrameShape(QFrame.Shape.NoFrame)
                 scroller.setWidget(widget)
                 widget = scroller
             dock.setWidget(widget)
             self.addDockWidget(area, dock)
             self.docks[key] = dock
-        self.tabifyDockWidget(self.docks["hex"], self.docks["info"])
+        self.tabifyDockWidget(self.docks["hex"], self.docks["integrity"])
+        self.tabifyDockWidget(self.docks["integrity"], self.docks["info"])
         self.docks["hex"].raise_()
-        self.resizeDocks([self.docks["inspector"]], [460], Qt.Orientation.Horizontal)
-        self.resizeDocks([self.docks["hex"]], [260], Qt.Orientation.Vertical)
+        self.resizeDocks([self.docks["tool"]], [340], Qt.Orientation.Horizontal)
+        self.resizeDocks([self.docks["hex"]], [250], Qt.Orientation.Vertical)
 
         self.worker = IntegrityWorker()
         self.worker.done.connect(self._hashes_ready)
@@ -141,63 +272,96 @@ class MainWindow(QMainWindow):
         self._build_toolbars()
         self._build_statusbar()
         self._connect()
+        self.set_workspace(str(self.settings.value("workspace", "edit")), save_current=False)
         self.set_document(None)
 
-    def _action(self, text, slot=None, shortcut=None, checkable=False, tip=None) -> QAction:
+    # ---------------------------------------------------------------- construction
+
+    def _action(self, text, slot=None, shortcut=None, checkable=False, tip=None, icon=None,
+                toggle: bool = False) -> QAction:
+        """toggle=True connects *slot* to toggled(bool), so it also runs when the state is set
+        from code (setChecked); otherwise to triggered (user activation only)."""
         action = QAction(text, self)
+        if icon:
+            action.setIcon(style.icon(icon))
         if shortcut is not None:
-            action.setShortcut(QKeySequence(shortcut))
+            if isinstance(shortcut, (list, tuple)):
+                action.setShortcuts([QKeySequence(s) for s in shortcut])
+            else:
+                action.setShortcut(QKeySequence(shortcut))
         action.setCheckable(checkable)
         if tip:
             action.setStatusTip(tip)
-            action.setToolTip(tip)
+        keys = action.shortcut().toString(QKeySequence.SequenceFormat.NativeText)
+        action.setToolTip(f"{(tip or text).replace('&', '')}" + (f"  ({keys})" if keys else ""))
         if slot is not None:
-            action.triggered.connect(slot)
+            (action.toggled if toggle else action.triggered).connect(slot)
         return action
 
     def _build_actions(self) -> None:
         a = self._action
         S = QKeySequence.StandardKey
-        self.act_open = a("&Open…", self.open_dialog, S.Open)
-        self.act_save = a("&Save", self.save, S.Save, tip="Encode, verify by re-decoding, then atomically replace")
+        self.act_open = a("&Open…", self.open_dialog, S.Open, icon="open")
+        self.act_save = a("&Save", self.save, S.Save, icon="save",
+                          tip="Save: encode, verify by re-decoding, then atomically replace")
         self.act_save_as = a("Save &As…", self.save_as, S.SaveAs)
-        self.act_compare = a("Compare PNG Pixel Buffers…", self.compare_dialog, "Ctrl+Shift+D")
+        self.act_compare = a("Compare Pixel Buffers…", self.compare_dialog, "Ctrl+Shift+D", icon="compare",
+                             tip="Compare the decoded pixels of two PNGs, or of this buffer and a PNG")
+        self.act_compare_disk = a("Compare with File on Disk", self.compare_with_disk,
+                                  tip="Compare the current buffer with the saved file it came from")
         self.act_quit = a("&Quit", self.close, S.Quit)
         self.act_quit.setMenuRole(QAction.MenuRole.QuitRole)
-        self.act_undo = a("&Undo", self.undo, S.Undo)
-        self.act_redo = a("&Redo", self.redo, S.Redo)
-        self.act_copy = a("&Copy Selection", self.copy, S.Copy)
-        self.act_paste = a("&Paste (click to place)", self.paste, S.Paste)
+        self.act_undo = a("&Undo", self.undo, S.Undo, icon="undo")
+        self.act_redo = a("&Redo", self.redo, [QKeySequence(S.Redo).toString(), "Ctrl+Shift+Z"], icon="redo")
+        self.act_copy = a("&Copy Selection", self.copy, S.Copy, icon="copy")
+        self.act_paste = a("&Paste (click to place)", self.paste, S.Paste, icon="paste")
         self.act_paste_at = a("Paste at Coordinates…", self.paste_at, "Ctrl+Shift+V")
-        self.act_fill = a("&Fill Selection with Pencil Colour", self.fill_selection, "Ctrl+Backspace")
+        self.act_fill = a("&Fill Selection with Pencil Colour", self.fill_selection, "Ctrl+Backspace", icon="fill")
         self.act_select_all = a("Select &All", self.select_all, S.SelectAll)
         self.act_deselect = a("&Deselect", self.deselect, "Ctrl+D")
-        self.act_goto = a("&Go to Pixel…", self.goto_pixel, "Ctrl+G")
+        self.act_goto = a("&Go to Pixel…", self.goto_pixel, "Ctrl+G", icon="goto")
+        self.act_restore_pixel = a("Restore Inspected Pixel to Original", self.restore_inspected_pixel,
+                                   tip="Write the inspected pixel's original values back (undoable)")
         self.act_transforms = {}
+        icons = {transforms.ROTATE_CW: "rotate-cw", transforms.ROTATE_CCW: "rotate-ccw",
+                 transforms.ROTATE_180: "rotate-180", transforms.FLIP_H: "flip-h", transforms.FLIP_V: "flip-v"}
         for op, key in ((transforms.ROTATE_CW, "Ctrl+R"), (transforms.ROTATE_CCW, "Ctrl+Shift+R"),
                         (transforms.ROTATE_180, None), (transforms.FLIP_H, None), (transforms.FLIP_V, None)):
-            self.act_transforms[op] = a(transforms.LABELS[op], lambda _=False, op=op: self.apply_transform(op), key)
-        self.act_zoom_in = a("Zoom &In", lambda: self.canvas.zoom_in(), S.ZoomIn)
-        self.act_zoom_out = a("Zoom &Out", lambda: self.canvas.zoom_out(), S.ZoomOut)
-        self.act_zoom_100 = a("Actual Pixels (100%)", lambda: self.canvas.set_zoom(1), "Ctrl+0")
-        self.act_zoom_fit = a("Fit in Window", lambda: self.canvas.zoom_to_fit(), "Ctrl+9")
-        self.act_grid = a("Pixel &Grid", self.canvas.set_grid, "Ctrl+'", checkable=True,
-                          tip=f"Show pixel boundaries at {zoom_label(4)} and above")
+            self.act_transforms[op] = a(transforms.LABELS[op], lambda _=False, op=op: self.apply_transform(op), key,
+                                        icon=icons[op])
+        self.act_zoom_in = a("Zoom &In", lambda: self.canvas.zoom_in(), [S.ZoomIn, "Ctrl+="], icon="zoom-in")
+        self.act_zoom_out = a("Zoom &Out", lambda: self.canvas.zoom_out(), S.ZoomOut, icon="zoom-out")
+        self.act_zoom_100 = a("Actual Pixels (100%)", lambda: self.canvas.set_zoom(1), "Ctrl+0", icon="zoom-100")
+        self.act_zoom_fit = a("Fit in Window", lambda: self.canvas.zoom_to_fit(), "Ctrl+9", icon="zoom-fit")
+        self.act_grid = a("Pixel &Grid", self.canvas.set_grid, "Ctrl+'", checkable=True, icon="grid", toggle=True,
+                          tip=f"Pixel grid (shown at {zoom_label(4)} and above)")
         self.act_highlight = a("&Highlight Changed Pixels", self._set_highlight, "Ctrl+Shift+H", checkable=True,
-                               tip="Tint pixels whose values differ from the original (display only)")
+                               toggle=True,
+                               icon="highlight", tip="Tint pixels whose values differ from the original (display only)")
         self.act_show_original = a("Show &Original (Before)", self._toggle_original, "\\", checkable=True,
+                                   toggle=True,
                                    tip="Display the original buffer aligned to the current orientation")
         self.tool_group = QActionGroup(self)
         self.act_tools = {}
-        for tool, label, key in (("inspect", "Inspect", "I"), ("pencil", "Pencil", "P"),
-                                 ("select", "Rectangle Select", "M"), ("hand", "Hand (pan)", "H")):
-            act = a(label, lambda _=False, t=tool: self.canvas.set_tool(t), key, checkable=True)
+        for tool, label, icon, key in TOOLS:
+            act = a(label, lambda _=False, t=tool: self.set_tool(t), key, checkable=True, icon=icon)
             self.tool_group.addAction(act)
             self.act_tools[tool] = act
         self.act_tools["inspect"].setChecked(True)
+        self.act_size_down = a("Smaller Pencil", lambda: self._nudge_size(-1), "[")
+        self.act_size_up = a("Larger Pencil", lambda: self._nudge_size(1), "]")
+        self.act_workspaces = {}
+        ws_group = QActionGroup(self)
+        for i, (key, (label, icon, _)) in enumerate(WORKSPACES.items(), 1):
+            act = a(f"{label} Workspace", lambda _=False, k=key: self.set_workspace(k), f"Ctrl+{i}",
+                    checkable=True, icon=icon)
+            ws_group.addAction(act)
+            self.act_workspaces[key] = act
+        self.act_reset_workspace = a("Reset Workspace Layout", self.reset_workspace)
         self.act_about = a("About eXact", self.about)
         self.act_about.setMenuRole(QAction.MenuRole.AboutRole)
-        self.act_guarantees = a("Preservation Guarantees", self.show_guarantees)
+        self.act_guarantees = a("Preservation Guarantees", self.show_guarantees, icon="shield")
+        self.act_shortcuts = a("Keyboard Shortcuts", self.show_shortcuts, "F1")
 
     def _build_menus(self) -> None:
         mb = self.menuBar()
@@ -206,6 +370,7 @@ class MainWindow(QMainWindow):
             m.addAction(act)
         m.addSeparator()
         m.addAction(self.act_compare)
+        m.addAction(self.act_compare_disk)
         m.addSeparator()
         comp = m.addMenu("PNG Compression Level")
         group = QActionGroup(self)
@@ -221,7 +386,8 @@ class MainWindow(QMainWindow):
 
         m = mb.addMenu("&Edit")
         for act in (self.act_undo, self.act_redo, None, self.act_copy, self.act_paste, self.act_paste_at,
-                    self.act_fill, None, self.act_select_all, self.act_deselect, None, self.act_goto):
+                    self.act_fill, None, self.act_select_all, self.act_deselect, None, self.act_goto,
+                    self.act_restore_pixel):
             m.addSeparator() if act is None else m.addAction(act)
 
         m = mb.addMenu("&Image")
@@ -236,64 +402,117 @@ class MainWindow(QMainWindow):
         m.addAction(self.act_show_original)
         m.addAction(self.act_highlight)
         m.addSeparator()
+        for act in self.act_workspaces.values():
+            m.addAction(act)
+        m.addAction(self.act_reset_workspace)
+        panels = m.addMenu("Panels")
         for dock in self.docks.values():
-            m.addAction(dock.toggleViewAction())
+            panels.addAction(dock.toggleViewAction())
+        theme = m.addMenu("Theme")
+        group = QActionGroup(self)
+        for key, label in (("dark", "Dark"), ("light", "Light")):
+            act = QAction(label, self, checkable=True)
+            act.setChecked(style.theme_name() == key)
+            act.triggered.connect(lambda _=False, k=key: self.set_theme(k))
+            group.addAction(act)
+            theme.addAction(act)
 
         m = mb.addMenu("&Tools")
         for act in self.act_tools.values():
             m.addAction(act)
+        m.addSeparator()
+        m.addAction(self.act_size_down)
+        m.addAction(self.act_size_up)
 
         m = mb.addMenu("&Help")
+        m.addAction(self.act_shortcuts)
         m.addAction(self.act_guarantees)
         m.addAction(self.act_about)
 
     def _build_toolbars(self) -> None:
-        tb = self.addToolBar("Main")
+        tb = QToolBar("Main")
         tb.setObjectName("main-toolbar")
-        tb.addAction(self.act_open)
-        tb.addAction(self.act_save)
-        tb.addSeparator()
-        tb.addAction(self.act_undo)
-        tb.addAction(self.act_redo)
-        tb.addSeparator()
-        for act in self.act_tools.values():
-            tb.addAction(act)
-        tb.addSeparator()
+        tb.setMovable(False)
+        tb.setIconSize(QSize(18, 18))
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, tb)
+        for act in (self.act_open, self.act_save, None, self.act_undo, self.act_redo, None,
+                    self.act_zoom_out):
+            tb.addSeparator() if act is None else tb.addAction(act)
         self.zoom_combo = QComboBox()
         for z in ZOOM_LEVELS:
             self.zoom_combo.addItem(zoom_label(z), z)
         self.zoom_combo.setToolTip("Nearest-neighbour zoom (display only). Below 100% shows sampled pixels.")
+        self.zoom_combo.setAccessibleName("Zoom level")
+        self.zoom_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         tb.addWidget(self.zoom_combo)
+        for act in (self.act_zoom_in, self.act_zoom_fit, self.act_zoom_100, None, self.act_grid, self.act_highlight):
+            tb.addSeparator() if act is None else tb.addAction(act)
+        tb.addSeparator()
         self.display_combo = QComboBox()
-        for key, label in DISPLAY_MODES.items():
+        for i, (key, label, tip) in enumerate(DISPLAY_CHOICES):
             self.display_combo.addItem(label, key)
+            self.display_combo.setItemData(i, tip, Qt.ItemDataRole.ToolTipRole)
         self.display_combo.setToolTip("How raw channels are shown. Never changes stored pixels.")
+        self.display_combo.setAccessibleName("Display mode")
         tb.addWidget(self.display_combo)
-        self.compare_combo = QComboBox()
-        for key, label in (("current", "Current"), ("original", "Original (before)"), ("split", "Split before | after")):
-            self.compare_combo.addItem(label, key)
+        tb.addSeparator()
+        self.compare_combo = Segmented([(k, label, icon, tip) for k, label, icon, tip in (
+            ("current", "Current", "eye", "Show the current buffer"),
+            ("original", "Original", "history", "Show the original buffer, aligned to the current orientation (\\)"),
+            ("split", "Split", "split", "Original on the left, current on the right; drag the slider to move the split"),
+        )])
         tb.addWidget(self.compare_combo)
         self.split_slider = QSlider(Qt.Orientation.Horizontal)
         self.split_slider.setRange(0, 1000)
         self.split_slider.setValue(500)
-        self.split_slider.setMaximumWidth(140)
+        self.split_slider.setFixedWidth(110)
         self.split_slider.setToolTip("Split position: original on the left, current on the right")
-        tb.addWidget(self.split_slider)
+        self.split_slider.setAccessibleName("Split position")
+        self.split_action = tb.addWidget(self.split_slider)
+        tb.addSeparator()
+        tb.addAction(self.act_compare)
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
+        self.workspace_switch = Segmented([(k, label, icon, f"{label} workspace (Ctrl+{i})")
+                                           for i, (k, (label, icon, _)) in enumerate(WORKSPACES.items(), 1)])
+        tb.addWidget(self.workspace_switch)
 
-        self.addToolBarBreak()
-        tb2 = self.addToolBar("Tool options")
-        tb2.setObjectName("tool-options")
-        self.tool_options = ToolOptions(self.tool_settings)
-        tb2.addWidget(self.tool_options)
-        tb2.addSeparator()
-        for op in transforms.OPS:
-            tb2.addAction(self.act_transforms[op])
+        pal = QToolBar("Tools")
+        pal.setObjectName("ToolPalette")
+        pal.setMovable(False)
+        pal.setOrientation(Qt.Orientation.Vertical)
+        pal.setIconSize(QSize(20, 20))
+        self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, pal)
+        for act in self.act_tools.values():
+            pal.addAction(act)
+        pal.addSeparator()
+        for op in (transforms.ROTATE_CCW, transforms.ROTATE_CW, transforms.FLIP_H, transforms.FLIP_V):
+            pal.addAction(self.act_transforms[op])
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        pal.addWidget(spacer)
+        self.color_chip = QToolButton()
+        self.color_chip.setIconSize(QSize(28, 14))
+        self.color_chip.setAccessibleName("Pencil colour")
+        self.color_chip.clicked.connect(lambda: (self.set_tool("pencil"), self.docks["tool"].show(),
+                                                 self.docks["tool"].raise_()))
+        pal.addWidget(self.color_chip)
+        self.palette = pal
 
     def _build_statusbar(self) -> None:
+        sb = self.statusBar()
+        sb.setSizeGripEnabled(True)
+        self.integrity_chip = QLabel()
+        self.integrity_chip.setToolTip("Integrity versus the original buffer")
+        self.save_chip = QLabel()
         self.pos_label = QLabel()
+        self.pos_label.setFont(style.mono_font(0.95))
+        self.pos_label.setMinimumWidth(320)
+        self.doc_label = QLabel()
         self.zoom_status = QLabel()
-        self.statusBar().addPermanentWidget(self.pos_label)
-        self.statusBar().addPermanentWidget(self.zoom_status)
+        for w in (self.pos_label, self.doc_label, self.zoom_status, self.integrity_chip, self.save_chip):
+            sb.addPermanentWidget(w)
 
     def _connect(self) -> None:
         c = self.canvas
@@ -301,19 +520,31 @@ class MainWindow(QMainWindow):
         c.hoverChanged.connect(self._hover_changed)
         c.pixelPicked.connect(self.set_inspected)
         c.strokeFinished.connect(self._stroke_finished)
-        c.colorPicked.connect(self.tool_options.set_color)
-        c.selectionChanged.connect(lambda _: self._update_actions())
+        c.colorPicked.connect(self._color_picked)
+        c.selectionChanged.connect(lambda _: self._selection_changed())
         c.pasteCommitted.connect(self._paste_commit)
         c.pasteCancelled.connect(lambda: self.statusBar().showMessage("Paste cancelled", 3000))
         self.inspector.applyRequested.connect(self._apply_pixel)
-        self.inspector.useAsColor.connect(self.tool_options.set_color)
+        self.inspector.useAsColor.connect(self.tool_panel.set_color)
+        self.inspector.gotoRequested.connect(self.goto_pixel)
+        self.tool_panel.changed.connect(self._tool_settings_changed)
+        self.tool_panel.selectionEdited.connect(self._selection_edited)
+        self.tool_panel.actionRequested.connect(self._tool_action)
+        self.history_panel.jumpRequested.connect(self.jump_to_history)
+        self.history_panel.undoRequested.connect(self.undo)
+        self.history_panel.redoRequested.connect(self.redo)
         self.hex_panel.offsetChosen.connect(self._goto_offset)
+        self.hex_panel.pixelChosen.connect(self._goto_xy)
         self.integrity_panel.recomputeRequested.connect(self._start_hashing)
+        self.integrity_panel.compareRequested.connect(self.compare_dialog)
         self.zoom_combo.activated.connect(lambda i: self.canvas.set_zoom(self.zoom_combo.itemData(i)))
         self.display_combo.currentIndexChanged.connect(self._display_mode_changed)
-        self.compare_combo.currentIndexChanged.connect(self._compare_changed)
+        self.compare_combo.changed.connect(lambda _: self._compare_changed())
         self.split_slider.valueChanged.connect(self._split_changed)
+        self.workspace_switch.changed.connect(self.set_workspace)
         self._zoom_changed(self.canvas.zoom)
+        self._compare_changed()
+        self._tool_settings_changed()
 
     @property
     def compress_level(self) -> int:
@@ -322,27 +553,85 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             return 6
 
+    # ---------------------------------------------------------------- workspaces
+
+    def _apply_workspace_defaults(self, name: str) -> None:
+        visible = WORKSPACES[name][2]
+        for key, dock in self.docks.items():
+            dock.setVisible(key in visible)
+        if name == "inspect":
+            self.docks["hex"].raise_()
+        self.resizeDocks([self.docks["inspector"]], [340], Qt.Orientation.Horizontal)
+        if name == "edit":
+            self.resizeDocks([self.docks["tool"], self.docks["inspector"], self.docks["history"]], [400, 360, 140],
+                             Qt.Orientation.Vertical)
+        if name == "inspect":
+            self.resizeDocks([self.docks["hex"]], [280], Qt.Orientation.Vertical)
+
+    def set_workspace(self, name: str, *, save_current: bool = True) -> None:
+        if name not in WORKSPACES:
+            name = "edit"
+        if self.workspace == name:
+            return
+        if save_current and self.workspace is not None:
+            self.settings.setValue(f"workspace_state/{self.workspace}", self.saveState())
+        state = self.settings.value(f"workspace_state/{name}")
+        if state is None or not self.restoreState(state):
+            self._apply_workspace_defaults(name)
+        self.workspace = name
+        self.settings.setValue("workspace", name)
+        self.act_workspaces[name].setChecked(True)
+        self.workspace_switch.set_value(name, emit=False)
+        if name == "inspect" and self.canvas.tool not in ("inspect", "hand", "zoom"):
+            self.set_tool("inspect")
+
+    def reset_workspace(self) -> None:
+        self.settings.remove(f"workspace_state/{self.workspace}")
+        self._apply_workspace_defaults(self.workspace)
+
+    def set_theme(self, name: str) -> None:
+        self.settings.setValue("theme", name)
+        style.apply_theme(QApplication.instance(), name)
+        restyle_chips()
+        self._tool_settings_changed()
+        self.info_panel.show_document(self.doc)
+        self.document_changed(None)
+        self.canvas.viewport().update()
+        self.hex_panel.view.viewport().update()
+
+    # ---------------------------------------------------------------- document
+
     def set_busy(self, busy: bool) -> None:
         self.canvas.busy = busy
+
+    def set_tool(self, tool: str) -> None:
+        self.canvas.set_tool(tool)
+        self.act_tools[tool].setChecked(True)
+        self.tool_panel.set_tool(tool)
+        if tool in ("pencil", "select", "eyedropper") and self.workspace == "edit":
+            self.docks["tool"].show()
 
     def set_document(self, doc: Document | None) -> None:
         self.doc = doc
         self.hashes = None
+        self.hashed_at = None
         self.canvas.set_document(doc)
-        self.tool_options.set_mode(doc.mode if doc else None)
+        self.tool_panel.set_mode(doc.mode if doc else None)
         if doc is not None:
             self._display_mode_changed()
             self._compare_changed()
             self.canvas.doc_source.highlight_changes = self.act_highlight.isChecked()
             self.canvas.zoom_to_fit()
         self.inspector.show_pixel(None, None)
-        self.hex_panel.show_bytes(None, None)
+        self.hex_panel.set_document(doc)
         self.info_panel.show_document(doc)
         self.document_changed(None)
         if doc is not None:
             self.set_inspected(0, 0)
 
     def document_changed(self, summary: OperationSummary | None, *, region: Rect | None = None) -> None:
+        """Refresh views after an operation completes (never per mouse move): counters are
+        O(1), the history list is short, and the full SHA-256 is debounced off-thread."""
         doc = self.doc
         if summary is not None:
             self.statusBar().showMessage(summary.describe(), 15000)
@@ -359,9 +648,28 @@ class MainWindow(QMainWindow):
                     self.set_inspected(x, y)
                 else:
                     self.set_inspected(0, 0)
-        self.integrity_panel.show_document(doc, self.hashes)
+            self.hex_panel.view.refresh()
+        self.integrity_panel.show_document(doc, self.hashes, self.hashed_at)
+        self.history_panel.show_document(doc)
+        self._update_status()
         self._update_title()
         self._update_actions()
+        self._selection_changed()
+
+    def _update_status(self) -> None:
+        doc = self.doc
+        if doc is None:
+            for w in (self.integrity_chip, self.save_chip):
+                w.hide()
+            self.doc_label.setText("")
+            return
+        state = integrity_state(doc, self.hashes)
+        for chip, (kind, title, detail) in ((self.integrity_chip, state["original"]),
+                                            (self.save_chip, state["saved"])):
+            style.set_pill(chip, kind, title)
+            chip.setToolTip(detail)
+            chip.show()
+        self.doc_label.setText(f"{doc.width} × {doc.height} {doc.mode}")
 
     def _update_title(self) -> None:
         doc = self.doc
@@ -372,8 +680,10 @@ class MainWindow(QMainWindow):
     def _update_actions(self) -> None:
         has = self.doc is not None
         for act in (self.act_save, self.act_save_as, self.act_select_all, self.act_goto, self.act_zoom_in,
-                    self.act_zoom_out, self.act_zoom_100, self.act_zoom_fit, *self.act_transforms.values()):
+                    self.act_zoom_out, self.act_zoom_100, self.act_zoom_fit, self.act_compare_disk,
+                    *self.act_transforms.values()):
             act.setEnabled(has)
+        self.act_compare_disk.setEnabled(bool(has and self.doc.path))
         has_sel = has and self.canvas.selection is not None
         self.act_copy.setEnabled(has_sel)
         self.act_fill.setEnabled(has_sel)
@@ -385,6 +695,9 @@ class MainWindow(QMainWindow):
         self.act_redo.setEnabled(bool(h and h.can_redo))
         self.act_undo.setText(f"&Undo {h.undo_label}" if h and h.can_undo else "&Undo")
         self.act_redo.setText(f"&Redo {h.redo_label}" if h and h.can_redo else "&Redo")
+        self.act_undo.setToolTip(f"Undo {h.undo_label}  (Ctrl+Z)" if h and h.can_undo else "Nothing to undo")
+        self.act_redo.setToolTip(f"Redo {h.redo_label}  (Ctrl+Shift+Z)" if h and h.can_redo else "Nothing to redo")
+        self.act_restore_pixel.setEnabled(has and self.canvas.inspected is not None)
 
     def _start_hashing(self) -> None:
         if self.doc is None:
@@ -399,10 +712,14 @@ class MainWindow(QMainWindow):
             self.hash_timer.start()
             return
         self.hashes = hashes
-        self.integrity_panel.show_document(doc, hashes)
+        self.hashed_at = time.time()
+        self.integrity_panel.show_document(doc, hashes, self.hashed_at)
+        self._update_status()
+
+    # ---------------------------------------------------------------- view state
 
     def _zoom_changed(self, zoom: float) -> None:
-        self.zoom_status.setText(f"Zoom {zoom_label(zoom)}")
+        self.zoom_status.setText(zoom_label(zoom))
         idx = self.zoom_combo.findData(zoom)
         if idx >= 0:
             self.zoom_combo.setCurrentIndex(idx)
@@ -413,10 +730,12 @@ class MainWindow(QMainWindow):
             return
         x, y = pixel
         values = self.doc.get_pixel(x, y)
-        hexed = "".join(f"{v:02X}" for v in values)
-        self.pos_label.setText(f"({x}, {y})  {' '.join(map(str, values))}  #{hexed}")
+        names = self.doc.channel_names
+        parts = "  ".join(f"{n} {v:3d}" for n, v in zip(names, values))
+        self.pos_label.setText(f"x {x:<5} y {y:<5} {parts}  #{''.join(f'{v:02X}' for v in values)}")
         if self.hex_panel.follow.isChecked():
-            self.hex_panel.show_bytes(self.doc, pixel_offset(x, y, self.doc.width, self.doc.channels), self.doc.channels)
+            self.hex_panel.show_bytes(self.doc, pixel_offset(x, y, self.doc.width, self.doc.channels),
+                                      self.doc.channels)
 
     def _display_mode_changed(self) -> None:
         if self.canvas.doc_source:
@@ -424,19 +743,20 @@ class MainWindow(QMainWindow):
             self.canvas.viewport().update()
 
     def _compare_changed(self) -> None:
-        mode = self.compare_combo.currentData()
-        self.split_slider.setEnabled(mode == "split")
+        mode = self.compare_combo.value()
+        self.split_action.setVisible(mode == "split")
         self.act_show_original.blockSignals(True)
         self.act_show_original.setChecked(mode == "original")
         self.act_show_original.blockSignals(False)
         if self.canvas.doc_source:
             self.canvas.doc_source.compare = mode
             self.canvas.viewport().update()
-        if mode == "original":
-            self.statusBar().showMessage("Showing ORIGINAL pixels (aligned to current orientation). Edits still apply to the current buffer.")
+        if mode == "original" and self.doc is not None:
+            self.statusBar().showMessage("Showing ORIGINAL pixels (aligned to current orientation). "
+                                         "Edits still apply to the current buffer.")
 
     def _toggle_original(self, on: bool) -> None:
-        self.compare_combo.setCurrentIndex(self.compare_combo.findData("original" if on else "current"))
+        self.compare_combo.set_value("original" if on else "current")
 
     def _split_changed(self, value: int) -> None:
         if self.canvas.doc_source:
@@ -448,23 +768,77 @@ class MainWindow(QMainWindow):
             self.canvas.doc_source.highlight_changes = on
             self.canvas.viewport().update()
 
+    def _tool_settings_changed(self) -> None:
+        ts = self.tool_settings
+        self.color_chip.setIcon(QIcon(swatch(ts.color, 14, self.color_chip)))
+        self.color_chip.setToolTip(f"Pencil colour #{''.join(f'{v:02X}' for v in ts.color)}, size {ts.size}px. "
+                                   "Click for pencil settings.")
+
+    def _color_picked(self, values) -> None:
+        self.tool_panel.set_color(values)
+        hexed = "".join(f"{v:02X}" for v in values)
+        self.statusBar().showMessage(f"Pencil colour set to #{hexed} (raw values, nothing modified)", 5000)
+
+    def _nudge_size(self, delta: int) -> None:
+        self.tool_panel.size_spin.setValue(self.tool_panel.size_spin.value() + delta)
+
+    def _selection_changed(self) -> None:
+        doc = self.doc
+        self.tool_panel.set_selection(self.canvas.selection, doc.width if doc else 0, doc.height if doc else 0,
+                                      has_clip=bool(doc and self.clipboard is not None))
+        self._update_actions_selection()
+
+    def _update_actions_selection(self) -> None:
+        has_sel = self.doc is not None and self.canvas.selection is not None
+        for act in (self.act_copy, self.act_fill, self.act_deselect):
+            act.setEnabled(has_sel)
+
+    def _selection_edited(self, rect: Rect) -> None:
+        if self.doc is None:
+            return
+        rect = rect.clamp(self.doc.width, self.doc.height)
+        self.canvas.set_selection(None if rect.empty else rect)
+
+    def _tool_action(self, key: str) -> None:
+        {"select_all": self.select_all, "deselect": self.deselect, "copy": self.copy, "paste": self.paste,
+         "paste_at": self.paste_at, "fill": self.fill_selection}[key]()
+
     def set_inspected(self, x: int, y: int) -> None:
         if self.doc is None:
             return
         self.canvas.set_inspected((x, y))
         self.inspector.show_pixel(self.doc, (x, y))
         if not self.hex_panel.follow.isChecked():
-            self.hex_panel.show_bytes(self.doc, pixel_offset(x, y, self.doc.width, self.doc.channels), self.doc.channels)
+            self.hex_panel.show_bytes(self.doc, pixel_offset(x, y, self.doc.width, self.doc.channels),
+                                      self.doc.channels)
+        self.act_restore_pixel.setEnabled(True)
 
     def _goto_offset(self, offset: int) -> None:
         doc = self.doc
         if doc is None or offset >= doc.pixels.size:
-            self.statusBar().showMessage("Offset outside the pixel buffer", 4000)
+            self.statusBar().showMessage(
+                f"Offset outside the pixel buffer (0 … {doc.pixels.size - 1:,})" if doc else "No image open", 5000)
             return
         index = offset // doc.channels
         x, y = index % doc.width, index // doc.width
+        self.canvas.set_inspected((x, y))
+        self.inspector.show_pixel(doc, (x, y))
+        self.hex_panel.view.highlight = (index * doc.channels, doc.channels)
+        self.hex_panel.view.cursor = offset
+        self.hex_panel.show_bytes(doc, offset, 0)
+        self.hex_panel.view.highlight = (index * doc.channels, doc.channels)
+        self.canvas.center_on(x + 0.5, y + 0.5)
+
+    def _goto_xy(self, x: int, y: int) -> None:
+        if self.doc is None:
+            return
+        if not (0 <= x < self.doc.width and 0 <= y < self.doc.height):
+            self.statusBar().showMessage(f"({x}, {y}) is outside the {self.doc.width}×{self.doc.height} image", 5000)
+            return
         self.set_inspected(x, y)
         self.canvas.center_on(x + 0.5, y + 0.5)
+
+    # ---------------------------------------------------------------- editing
 
     def _stroke_finished(self, summary: OperationSummary) -> None:
         self.document_changed(summary)
@@ -475,10 +849,32 @@ class MainWindow(QMainWindow):
         summary = self.doc.set_pixel(x, y, values)
         self.document_changed(summary, region=Rect(x, y, 1, 1))
 
+    def restore_inspected_pixel(self) -> None:
+        if self.doc is None or self.canvas.inspected is None:
+            return
+        x, y = self.canvas.inspected
+        original = tuple(int(v) for v in self.doc.reference()[y, x])
+        if original == self.doc.get_pixel(x, y):
+            self.statusBar().showMessage(f"({x}, {y}) already matches the original", 4000)
+            return
+        summary = self.doc.set_pixel(x, y, original, label=f"Restore pixel ({x}, {y})")
+        self.document_changed(summary, region=Rect(x, y, 1, 1))
+
+    def jump_to_history(self, position: int) -> None:
+        """Undo or redo until *position* commands are applied."""
+        if self.doc is None:
+            return
+        current = len(self.doc.history)
+        for _ in range(abs(position - current)):
+            (self.undo if position < current else self.redo)()
+
+    # ---------------------------------------------------------------- files
+
     def open_dialog(self) -> None:
         if not self.maybe_save_changes():
             return
-        start = os.path.dirname(self.doc.path) if self.doc and self.doc.path else ""
+        start = os.path.dirname(self.doc.path) if self.doc and self.doc.path else str(
+            self.settings.value("last_dir", ""))
         path, _ = QFileDialog.getOpenFileName(self, "Open PNG", start, "PNG images (*.png);;All files (*)")
         if path:
             self.open_path(path)
@@ -487,16 +883,10 @@ class MainWindow(QMainWindow):
         name = os.path.basename(path)
         try:
             doc = run_blocking(self, f"Opening {name}…", Document.open, path)
-        except UnsupportedPngError as exc:
-            QMessageBox.warning(self, "Unsupported PNG",
-                                f"<b>{name}</b> was not opened.<br><br>{exc}<br><br>No conversion was performed.")
+        except Exception as exc:  # explained to the user; nothing was opened or converted
+            show_error(self, exc, "open", note=f"{name} was not opened. No conversion was performed.")
             return False
-        except PngFormatError as exc:
-            QMessageBox.warning(self, "Invalid PNG", f"{name} is not a valid PNG: {exc}")
-            return False
-        except OSError as exc:
-            QMessageBox.warning(self, "Cannot open", str(exc))
-            return False
+        self.settings.setValue("last_dir", os.path.dirname(os.path.abspath(path)))
         self.set_document(doc)
         serious = [w for w in doc.warnings if any(k in w for k in ("APNG", "CRC", "after IEND"))]
         if serious:
@@ -564,13 +954,11 @@ class MainWindow(QMainWindow):
         try:
             report = run_blocking(self, "Encoding, re-decoding and verifying…", doc.save, plan,
                                   compress_level=self.compress_level)
-        except SaveVerificationError as exc:
-            QMessageBox.critical(self, "Save verification FAILED",
-                                 f"The written file did not decode to the intended pixels:\n\n{exc}\n\n"
-                                 f"{short_path(path)} was NOT modified.")
-            return None
-        except OSError as exc:
-            QMessageBox.critical(self, "Save failed", f"{exc}\n\n{short_path(path)} was NOT modified.")
+        except Exception as exc:
+            if interactive:
+                show_error(self, exc, "save", note=f"{short_path(path)} was NOT modified.")
+            else:
+                self.statusBar().showMessage(f"Save failed: {exc}. {short_path(path)} was NOT modified.")
             return None
         changed = [d for d in report.decisions if d.action in ("updated", "dropped")]
         kept = sum(1 for d in report.decisions if d.action == "preserved")
@@ -585,6 +973,15 @@ class MainWindow(QMainWindow):
 
     def compare_dialog(self) -> None:
         DiffDialog(self, self.doc).exec()
+
+    def compare_with_disk(self) -> None:
+        if self.doc is None or not self.doc.path:
+            return
+        dialog = DiffDialog(self, self.doc, path_b=self.doc.path, use_current=True)
+        dialog.run_compare()
+        dialog.exec()
+
+    # ---------------------------------------------------------------- transforms
 
     def _confirm_transform(self, op: str) -> bool:
         if self.settings.value("skip_transform_notice", False, type=bool):
@@ -641,6 +1038,8 @@ class MainWindow(QMainWindow):
                 self.canvas.set_selection(None)
             self.document_changed(summary)
 
+    # ---------------------------------------------------------------- selection & clipboard
+
     def select_all(self) -> None:
         if self.doc:
             self.canvas.set_selection(Rect(0, 0, self.doc.width, self.doc.height))
@@ -656,6 +1055,7 @@ class MainWindow(QMainWindow):
             f"Copied {self.clipboard.width}×{self.clipboard.height} {self.clipboard.mode} pixels "
             "(internal clipboard, raw channel values)", 6000)
         self._update_actions()
+        self._selection_changed()
 
     def _confirm_channel_mismatch(self) -> bool:
         note = self.doc.paste_channel_note(self.clipboard)
@@ -730,15 +1130,41 @@ class MainWindow(QMainWindow):
         self.canvas.center_on(x + 0.5, y + 0.5)
         self.set_inspected(x, y)
 
+    # ---------------------------------------------------------------- help
+
     def about(self) -> None:
         QMessageBox.about(
             self, "About eXact",
             f"<h2>eXact {__version__}</h2><p><b>eXtensible Accurate Color Toolkit</b></p>"
             f"<p><i>{TAGLINE}</i></p><p>A binary-preserving pixel editor for 8-bit RGB/RGBA PNGs.</p>"
-            f"<p>{MOTTO}</p>")
+            f"<p><b>{style.MOTTO}</b><br><i>{style.MOTTO_FOOTNOTE}</i></p><p>{MOTTO}</p>")
 
     def show_guarantees(self) -> None:
         QMessageBox.information(self, "Preservation guarantees", GUARANTEES_TEXT)
+
+    def show_shortcuts(self) -> None:
+        rows = []
+        for title, actions in (
+                ("Tools", list(self.act_tools.values()) + [self.act_size_down, self.act_size_up]),
+                ("File", [self.act_open, self.act_save, self.act_save_as, self.act_compare]),
+                ("Edit", [self.act_undo, self.act_redo, self.act_copy, self.act_paste, self.act_paste_at,
+                          self.act_fill, self.act_select_all, self.act_deselect, self.act_goto]),
+                ("View", [self.act_zoom_in, self.act_zoom_out, self.act_zoom_100, self.act_zoom_fit, self.act_grid,
+                          self.act_show_original, self.act_highlight, *self.act_workspaces.values()]),
+                ("Image", [self.act_transforms[transforms.ROTATE_CW], self.act_transforms[transforms.ROTATE_CCW]])):
+            rows.append(f"<tr><td colspan=2><br><b>{title}</b></td></tr>")
+            for act in actions:
+                keys = act.shortcut().toString(QKeySequence.SequenceFormat.NativeText)
+                if keys:
+                    name = act.text().replace("&", "").split(" Undo ")[0]
+                    rows.append(f"<tr><td style='padding-right:24px'>{name}</td><td><tt>{keys}</tt></td></tr>")
+        rows.append("<tr><td colspan=2><br><b>Canvas</b></td></tr>")
+        for name, keys in (("Pan", "Space+drag, middle-drag, scroll"), ("Zoom at cursor", "Ctrl+scroll"),
+                           ("Pick colour (Pencil)", "Alt+click"), ("Cancel paste", "Esc / right-click")):
+            rows.append(f"<tr><td style='padding-right:24px'>{name}</td><td><tt>{keys}</tt></td></tr>")
+        QMessageBox.information(self, "Keyboard shortcuts", "<table>" + "".join(rows) + "</table>")
+
+    # ---------------------------------------------------------------- window events
 
     def dragEnterEvent(self, event) -> None:
         if event.mimeData().hasUrls():
@@ -751,6 +1177,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         if self.maybe_save_changes():
+            if self.workspace is not None:
+                self.settings.setValue(f"workspace_state/{self.workspace}", self.saveState())
             event.accept()
         else:
             event.ignore()
