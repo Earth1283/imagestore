@@ -1,0 +1,3 @@
+# Optional graphical interface (python imagestore.py -g). The command line does not need it.
+-r requirements.txt
+PyQt6>=6.5

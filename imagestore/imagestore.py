@@ -696,19 +696,28 @@ def inspect_path(src: Path, task: Task | None = None) -> InspectResult:
         raise
     except ImageStoreError as e:
         return InspectResult(**base, meta=None, ok=False, error=e)
-    sha, n, error = hashlib.sha256(), 0, None
+    n, error = 0, None
     try:
         for chunk in task.track(chunks, "Verifying payload", meta.orig_size):
-            sha.update(chunk)
             n += len(chunk)
     except Cancelled:
         raise
     except ImageStoreError as e:
         error = e
-    # the checks run after the last chunk, so for size/SHA failures the digest is complete
-    complete = error is None or error.kind in ("sha", "size")
-    return InspectResult(**base, meta=meta, ok=error is None, error=error,
-                         computed_digest=sha.digest() if complete else None, decoded_size=n)
+    computed = meta.digest if error is None else None
+    if error is not None and error.kind in ("sha", "size"):
+        # Only on failure: decode again to show the digest of what the image actually holds
+        # (the check itself already hashed it once; a passing check needs no second pass).
+        sha = hashlib.sha256()
+        try:
+            for chunk in task.track(decode(img)[1], "Computing SHA-256 of the altered payload", meta.orig_size):
+                sha.update(chunk)
+        except Cancelled:
+            raise
+        except ImageStoreError:
+            pass  # the same failure again, after the last chunk: the digest is complete
+        computed = sha.digest()
+    return InspectResult(**base, meta=meta, ok=error is None, error=error, computed_digest=computed, decoded_size=n)
 
 
 # ------------------------------------------------------------------------ errors
@@ -739,16 +748,16 @@ _EXPLAIN = {
                   "resized or only partly copied."),
     "zlib": ("Compressed payload is corrupted",
              "The zlib stream inside the image could not be decompressed. Pixel values changed after "
-             "encoding (lossy re-compression, colour management or alpha premultiplication). No output "
-             "was written."),
+             "encoding (lossy re-compression, colour management or alpha premultiplication). Nothing is "
+             "written when this check fails."),
     "size": ("Integrity check failed (size mismatch)",
              "The payload decoded to a different length than the header records, so the pixels were "
-             "altered. No output was written."),
+             "altered. Nothing is written when this check fails."),
     "sha": ("Integrity check failed (SHA-256 mismatch)",
             "The payload decoded, but its checksum does not match the one stored at encode time. Some "
             "pixel values changed after encoding. Lossy re-encoding, alpha premultiplication and "
             "colour-profile conversion are the usual causes; chat apps, image hosts and many editors do "
-            "this. No output was written; use an untouched copy of the PNG."),
+            "this. Nothing is written when this check fails; use an untouched copy of the PNG."),
     "verify": ("Written PNG failed verification",
                "The PNG was written but did not decode back to the encoded data, so it was discarded. "
                "The disk or file system may be faulty."),
@@ -1158,7 +1167,11 @@ def _menu(here: Path) -> None:
         grid.add_row(f" {key}", name, desc)
     console.print()
     console.print(grid)
-    console.print(f"[dim]  in {escape(show_path(here))}[/]")
+    try:
+        where = "~/" + str(here.resolve().relative_to(Path.home().resolve()))
+    except (ValueError, OSError, RuntimeError):
+        where = str(here)
+    console.print(f"[dim]  in {escape(where)}[/]")
 
 
 def _ask_output(default: Path) -> tuple[Path, bool] | None:

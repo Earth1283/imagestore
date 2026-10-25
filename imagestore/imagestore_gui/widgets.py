@@ -88,11 +88,14 @@ class Runner(QObject):
 
         def work():
             try:
-                result = fn(*args, task=task, **kwargs)
-            except BaseException as exc:  # reported on the GUI thread
-                self.failed.emit(exc)
-            else:
-                self.finished.emit(result)
+                try:
+                    result = fn(*args, task=task, **kwargs)
+                except BaseException as exc:  # reported on the GUI thread
+                    self.failed.emit(exc)
+                else:
+                    self.finished.emit(result)
+            except RuntimeError:  # the window closed meanwhile: nobody to tell
+                pass
 
         self._thread = threading.Thread(target=work, name="imagestore-op", daemon=True)
         self._thread.start()
@@ -102,7 +105,10 @@ class Runner(QObject):
         last_label, last_time = self._last
         if label != last_label or now - last_time >= 0.05 or (total and done >= total):
             self._last = (label, now)
-            self.progress.emit(label, done, total)
+            try:
+                self.progress.emit(label, done, total)
+            except RuntimeError:  # window gone: stop the operation instead of failing to report
+                self.cancel()
 
     def cancel(self) -> None:
         if self._cancel is not None:
