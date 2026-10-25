@@ -28,7 +28,7 @@ from .canvas import HeatmapSource, PixelView, zoom_label
 from .display import heat_colors
 from .errors import show_error
 from .panels import StatusBlock, muted, section
-from .tasks import run_blocking
+from .tasks import TaskCancelled, run_blocking
 
 
 class DiffDialog(QDialog):
@@ -196,7 +196,10 @@ class DiffDialog(QDialog):
         a_pixels = self.doc.pixels.copy() if use_current else None
         try:
             comparison, self._a_pixels, self._b_pixels = run_blocking(
-                self, "Decoding and comparing…", self._load_and_compare, path_a, path_b, a_pixels)
+                self, "Decoding and comparing…", self._load_and_compare, path_a, path_b, a_pixels, cancellable=True)
+        except TaskCancelled:
+            self.verdict.set_state("info", "Comparison cancelled", "Nothing was changed.")
+            return
         except Exception as exc:
             show_error(self, exc, "compare")
             return

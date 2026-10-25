@@ -64,7 +64,7 @@ from .panels import (
     short_path,
     swatch,
 )
-from .tasks import run_blocking
+from .tasks import TaskCancelled, run_blocking
 
 HEAVY_PIXELS = 4_000_000
 GUARANTEES_TEXT = """\
@@ -148,7 +148,10 @@ class IntegrityWorker(QObject):
             except Exception as exc:  # buffer replaced mid-scan; caller retries
                 hashes = {"error": str(exc)}
             self._running = False
-            self.done.emit(doc, generation, hashes)
+            try:
+                self.done.emit(doc, generation, hashes)
+            except RuntimeError:  # the window closed while hashing: nobody to tell
+                pass
 
         threading.Thread(target=work, name="exact-integrity", daemon=True).start()
         return True
@@ -882,7 +885,10 @@ class MainWindow(QMainWindow):
     def open_path(self, path: str) -> bool:
         name = os.path.basename(path)
         try:
-            doc = run_blocking(self, f"Opening {name}…", Document.open, path)
+            doc = run_blocking(self, f"Opening {name}…", Document.open, path, cancellable=True)
+        except TaskCancelled:
+            self.statusBar().showMessage(f"Opening {name} was cancelled; nothing changed.", 6000)
+            return False
         except Exception as exc:  # explained to the user; nothing was opened or converted
             show_error(self, exc, "open", note=f"{name} was not opened. No conversion was performed.")
             return False

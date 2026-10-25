@@ -840,41 +840,69 @@ class HistoryPanel(QWidget):
         self.list.itemClicked.connect(self._activated)
         layout.addWidget(self.list, 1)
         self._position = 0
+        self._saved_row = -1
+        self._ids: list = []
         self._doc_key = None
 
     def show_document(self, doc: Document | None) -> None:
-        self.list.blockSignals(True)
-        self.list.clear()
+        """Update incrementally: an edit appends one row (and drops redo rows), undo/redo only
+        restyles rows, so the cost does not grow with the length of the history."""
         if doc is None:
+            self.list.clear()
+            self._ids, self._doc_key, self._saved_row = [], None, -1
             self.summary.setText("")
             self.undo_button.setEnabled(False)
             self.redo_button.setEnabled(False)
-            self.list.blockSignals(False)
             return
         h = doc.history
         done, undone = h.undo_stack, h.redo_stack
-        t = style.tokens()
-
-        def add(text: str, icon: str, state_id: int, applied: bool) -> None:
-            saved = doc.path is not None and state_id == doc.saved_state
-            item = QListWidgetItem(style.icon(icon), text + ("   ✓ saved" if saved else ""))
-            if not applied:
-                font = item.font()
-                font.setItalic(True)
-                item.setFont(font)
-                item.setForeground(style.QColor(t["text_faint"]))
-            if saved:
-                item.setToolTip("The saved file holds this state")
+        commands = [None, *done, *undone]
+        ids = [("base", h.base_state)] + [c.id for c in done + undone]
+        if self._doc_key is not doc:
+            self.list.clear()
+            self._ids, self._doc_key = [], doc
+        common = 0
+        for a, b in zip(self._ids, ids):
+            if a != b:
+                break
+            common += 1
+        self.list.blockSignals(True)
+        while self.list.count() > common:
+            self.list.takeItem(self.list.count() - 1)
+        for row in range(common, len(ids)):
+            cmd = commands[row]
+            if cmd is None:
+                text, icon = ("Original image" if h.base_state == 0 else "Earliest kept state"), "image"
+            else:
+                text, icon = cmd.label, _command_icon(cmd)
+            item = QListWidgetItem(style.icon(icon), text)
+            item.setData(Qt.ItemDataRole.UserRole, text)
             self.list.addItem(item)
-
-        add("Opened " + short_path(doc.path) if h.base_state == 0 else "Earliest kept state", "image",
-            h.base_state, True)
-        for cmd in done:
-            add(cmd.label, _command_icon(cmd), cmd.id, True)
-        for cmd in undone:
-            add(cmd.label, _command_icon(cmd), cmd.id, False)
-        self._position = len(done)
-        self.list.setCurrentRow(self._position)
+        self._ids = ids
+        position = len(done)
+        saved_row = next((i for i, x in enumerate(ids) if (x[1] if isinstance(x, tuple) else x) == doc.saved_state),
+                         -1) if doc.path is not None else -1
+        rows = {saved_row, getattr(self, "_saved_row", -1)}
+        lo, hi = sorted((getattr(self, "_position", 0), position))
+        rows.update(range(lo, hi + 1))
+        rows.update(range(common, len(ids)))
+        faint = style.QColor(style.tokens()["text_faint"])
+        normal = style.QColor(style.tokens()["text"])
+        for row in rows:
+            item = self.list.item(row)
+            if item is None:
+                continue
+            applied = row <= position
+            font = item.font()
+            font.setItalic(not applied)
+            item.setFont(font)
+            item.setForeground(normal if applied else faint)
+            base_text = item.data(Qt.ItemDataRole.UserRole)
+            item.setText(base_text + ("   ✓ saved" if row == saved_row else ""))
+            item.setToolTip("The saved file holds this state" if row == saved_row else "")
+        self._saved_row = saved_row
+        self._position = position
+        self.list.setCurrentRow(position)
         self.list.scrollToItem(self.list.currentItem())
         self.list.blockSignals(False)
         self.undo_button.setEnabled(h.can_undo)

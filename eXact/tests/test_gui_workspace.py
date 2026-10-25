@@ -393,3 +393,110 @@ def test_shared_style_copies_are_identical():
         pytest.skip("ImageStore checkout not next to eXact")
     with open(exact_copy, "rb") as a, open(store_copy, "rb") as b:
         assert a.read() == b.read(), "style.py copies differ: copy eXact's over ImageStore's (or vice versa)"
+
+
+def test_history_panel_incremental_updates_match_a_rebuild(app, window, rgba_png, tmp_path):
+    from exact.gui.panels import HistoryPanel
+
+    window.open_path(rgba_png)
+    doc = window.doc
+    for i in range(5):
+        window._apply_pixel(i, 0, (i, i, i, i))
+    window.undo()
+    window.undo()
+    window._apply_pixel(9, 9, (1, 1, 1, 1))  # drops the two redo entries
+    window.save_to(str(tmp_path / "saved.png"), interactive=False)
+    window.undo()
+
+    def rows(panel):
+        lst = panel.list
+        return [(lst.item(i).text(), lst.item(i).font().italic()) for i in range(lst.count())]
+
+    fresh = HistoryPanel()
+    fresh.show_document(doc)
+    assert rows(window.history_panel) == rows(fresh)
+    assert window.history_panel.list.count() == 5  # opened + 3 kept edits + the post-undo one
+    assert rows(fresh)[-1][0].endswith("✓ saved") and rows(fresh)[-1][1]  # saved state, currently undone
+
+
+@pytest.mark.slow
+def test_full_size_workspace_navigation_and_edit(app, window, tmp_path):
+    """7488×7487 RGBA through the GUI: open, render at fit/100%/3200%, scroll to the far corner,
+    hex-navigate to the last byte, edit one pixel, rotate there and back, save, verify."""
+    rng = np.random.default_rng(11)
+    arr = rng.integers(0, 256, (7487, 7488, 4), dtype=np.uint8)
+    path = str(tmp_path / "full.png")
+    save_png(path, arr, compress_level=1)
+    expected = sha(arr)
+    assert window.open_path(path)
+    doc, canvas = window.doc, window.canvas
+    assert doc.original_sha256 == expected
+    timings = {}
+    for zoom in (0.125, 1, 32):
+        canvas.set_zoom(zoom)
+        canvas.center_on(7487, 7486)
+        start = time.perf_counter()
+        canvas.viewport().grab()
+        timings[zoom] = time.perf_counter() - start
+    assert canvas.tiles._bytes <= canvas.tiles.max_bytes
+    window.set_workspace("inspect")
+    view = window.hex_panel.view
+    assert np.shares_memory(doc.pixels.reshape(-1), doc.pixels)  # the hex view never copies the buffer
+    view.setFocus()
+    key(view, Qt.Key.Key_End, Qt.KeyboardModifier.ControlModifier)
+    assert window.canvas.inspected == (7487, 7486)
+    window._apply_pixel(7487, 7486, (1, 2, 3, 4))
+    window.apply_transform(T.ROTATE_CW, confirm=False)
+    window.apply_transform(T.ROTATE_CCW, confirm=False)
+    assert doc.content_diff_pixels == 1 and doc.orientation.is_identity
+    window.save_to(path, interactive=False)
+    out = load_png(path).pixels
+    arr[-1, -1] = (1, 2, 3, 4)
+    assert out.tobytes() == arr.tobytes()
+    print("paint at zoom:", {z: f"{t * 1000:.0f} ms" for z, t in timings.items()})
+
+
+def test_cancelled_open_changes_nothing(app, window, rgba_png, payload_rgba, monkeypatch):
+    """Cancelling a slow open returns at once; the current document is untouched."""
+    import threading
+
+    from PyQt6.QtCore import QTimer
+    from PyQt6.QtWidgets import QProgressDialog
+
+    from exact.core.document import Document
+
+    window.open_path(rgba_png)
+    doc = window.doc
+    release = threading.Event()
+    real_open = Document.open
+
+    def slow_open(path, **kw):
+        release.wait(5)
+        return real_open(path, **kw)
+
+    monkeypatch.setattr(Document, "open", staticmethod(slow_open))
+
+    def cancel():
+        for w in QtWidgets.QApplication.topLevelWidgets():
+            if isinstance(w, QProgressDialog):
+                w.cancel()
+
+    QTimer.singleShot(100, cancel)
+    assert window.open_path(rgba_png) is False
+    release.set()
+    assert window.doc is doc and doc.pixels.tobytes() == payload_rgba.tobytes()
+    assert "cancelled" in window.statusBar().currentMessage()
+    assert not window.canvas.busy
+
+
+def test_saves_and_transforms_are_never_cancellable(app, window, rgba_png, monkeypatch):
+    calls = []
+    import exact.gui.main_window as mw
+
+    real = mw.run_blocking
+    monkeypatch.setattr(mw, "run_blocking", lambda *a, **k: calls.append(k.get("cancellable", False)) or real(*a, **k))
+    monkeypatch.setattr(mw, "HEAVY_PIXELS", 1)
+    window.open_path(rgba_png)
+    window.apply_transform(T.ROTATE_CW, confirm=False)
+    window.save_to(rgba_png + ".out.png", interactive=False)
+    assert calls == [True, False, False]  # open: cancellable; transform and save: not
