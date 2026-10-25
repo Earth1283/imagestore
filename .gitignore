@@ -20,6 +20,8 @@ htmlcov/
 
 # ImageStore default output for `encode -t` (scratch text images)
 text.png
+# ...but not the frozen legacy test fixture of that name
+!/imagestore/tests/fixtures/legacy/text.png
 
 # eXact temporary save files (left only if the process is killed mid-save)
 *.exact-tmp
