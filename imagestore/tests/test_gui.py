@@ -242,3 +242,27 @@ def test_close_while_running_cancels_and_waits(app, tmp_path, monkeypatch):
     leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".") or p.suffix == ".png"]
     assert leftovers == [] or all(not n.endswith(".part") for n in leftovers)
     page.compress.setChecked(True)
+
+
+def test_window_choice_is_used_remembered_and_follows_compress(app, window, tmp_path):
+    page = window.encode_page
+    assert page.window_mib() == 64 and page.window_size.isEnabled()
+    page.compress.setChecked(False)
+    assert not page.window_size.isEnabled()
+    page.compress.setChecked(True)
+
+    page.window_size.setCurrentIndex(page.window_size.findData(1))
+    src = tmp_path / "a.txt"
+    src.write_text("hello " * 5000)
+    page.set_source(src)
+    seen = {}
+    real = imagestore.encode_path
+    imagestore.encode_path = lambda *a, **kw: seen.update(kw) or real(*a, **kw)
+    try:
+        page.primary()
+        wait(app, page)
+    finally:
+        imagestore.encode_path = real
+
+    assert seen["window"] == 1 << 20
+    assert page.settings.value("window_mib", type=int) == 1

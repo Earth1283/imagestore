@@ -97,7 +97,7 @@ a hint.
 - Keep the PNG pixel-exact. Lossy re-encoding, alpha premultiplication or stripping alpha
   breaks the SHA-256 check; the error message says so. Use [eXact](../eXact/README.md) to
   edit these images safely.
-- zlib compression is applied only when it makes the payload smaller.
+- zlib or LZMA compression (whichever is smaller) is applied only when it makes the payload smaller.
 - The digest detects corruption; it is not encryption.
 
 ## Tests

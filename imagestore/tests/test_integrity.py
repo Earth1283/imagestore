@@ -225,7 +225,7 @@ def test_failed_folder_restore_leaves_nothing_behind(istore, tmp_path):
 
 # --------------------------------------------------------------------- explain()
 
-KINDS = ["magic", "mode", "too_small", "version", "truncated", "zlib", "size", "sha", "verify",
+KINDS = ["magic", "mode", "too_small", "version", "truncated", "zlib", "squeeze", "memory", "size", "sha", "verify",
          "extract", "exists", "missing", "source_changed", "cancelled", "open", "text"]
 
 

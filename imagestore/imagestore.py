@@ -15,8 +15,11 @@ import fnmatch
 import hashlib
 import hmac
 import io
+import itertools
+import lzma
 import math
 import os
+import re
 import shutil
 import struct
 import sys
@@ -42,12 +45,18 @@ VERSION = 2  # v2: SHA-256 digest replaced the v1 CRC32
 FLAG_ZLIB = 0x01
 FLAG_TEXT = 0x02  # payload is UTF-8 text: decode prints it instead of writing a file
 FLAG_DIR = 0x04   # payload is an uncompressed tar of a folder
+FLAG_SQUEEZE = 0x08  # payload has its zero runs squeezed out (folders only)
+FLAG_LZMA = 0x10  # payload is a raw LZMA2 stream
 # magic, version, flags, original size, stored size, sha256 of original, name length
 HEADER = struct.Struct(">4sBBQQ32sH")
 TEXT_NAME = "text.txt"
 # matched against entry names (never the root folder itself) when auto-ignore is on
 IGNORE_PATTERNS = (".DS_Store", "._*", "Thumbs.db", "desktop.ini", ".Trashes", ".Spotlight-V100",
                    "node_modules", "__pycache__", "*.pyc", ".git", ".venv", "venv")
+LZMA_WINDOW = 64 << 20  # default cap on the LZMA window; encoding takes roughly 7x the window in RAM
+LZMA_WINDOW_LIMIT = 1 << 30  # the most a user may ask for
+SQUEEZE_MIN = 8  # shortest run of zero bytes worth a record of its own
+_ZERO_RUN = re.compile(rb"\x00{%d,}" % SQUEEZE_MIN)
 BPP = 4  # R, G, B, A: every byte of every channel carries data
 CHUNK = 1 << 20  # streaming granularity: hashing, (de)compression and pixel reads work in pieces this size
 SPOOL = 8 << 20  # scratch data stays in RAM up to this size, then spills to a temp file
@@ -79,7 +88,7 @@ class Meta:
 
     @property
     def compressed(self) -> bool:
-        return bool(self.flags & FLAG_ZLIB)
+        return bool(self.flags & (FLAG_ZLIB | FLAG_LZMA))
 
     @property
     def is_text(self) -> bool:
@@ -89,6 +98,16 @@ class Meta:
     def is_dir(self) -> bool:
         return bool(self.flags & FLAG_DIR)
 
+    @property
+    def squeezed(self) -> bool:
+        return bool(self.flags & FLAG_SQUEEZE)
+
+    @property
+    def method(self) -> str:
+        """How the payload is stored: zlib, lzma, squeezed or raw."""
+        return next((n for f, n in ((FLAG_ZLIB, "zlib"), (FLAG_LZMA, "lzma"), (FLAG_SQUEEZE, "squeezed"))
+                     if self.flags & f), "raw")
+
 
 # --------------------------------------------------------------------------- core
 
@@ -97,27 +116,79 @@ def _spool() -> BinaryIO:
     return tempfile.SpooledTemporaryFile(max_size=SPOOL)
 
 
-def encode(src: BinaryIO, name: str, compress: bool = True, kind: int = 0) -> tuple[Image.Image, Meta]:
-    """Build the image from a seekable binary stream, holding only the pixel buffer in memory."""
+def lzma_window(orig_size: int, cap: int = LZMA_WINDOW) -> int:
+    """The window used for *orig_size* bytes: the smallest power of two that covers the data,
+    but at most *cap* (itself rounded up to a power of two and held within 4 KiB .. the limit)."""
+    cap = 1 << (min(max(cap, 4096), LZMA_WINDOW_LIMIT) - 1).bit_length()
+    return min(1 << max(12, max(orig_size - 1, 0).bit_length()), cap)
+
+
+def lzma_filters(window: int) -> list[dict]:
+    return [{"id": lzma.FILTER_LZMA2, "preset": 6, "dict_size": window}]
+
+
+def _varint(n: int) -> bytes:
+    out = bytearray()
+    while n > 0x7F:
+        out.append(n & 0x7F | 0x80)
+        n >>= 7
+    out.append(n)
+    return bytes(out)
+
+
+def squeeze(chunk: bytes) -> bytes:
+    """Replace zero runs with their length: records of varint(zeros) varint(len) literal.
+    Chunks are squeezed independently, so a run across a boundary becomes two records."""
+    out, zeros, pos = [], 0, 0
+    for m in _ZERO_RUN.finditer(chunk):
+        lit = chunk[pos:m.start()]
+        if zeros or lit:
+            out += (_varint(zeros), _varint(len(lit)), lit)
+        zeros, pos = m.end() - m.start(), m.end()
+    lit = chunk[pos:]
+    if zeros or lit:
+        out += (_varint(zeros), _varint(len(lit)), lit)
+    return b"".join(out)
+
+
+def encode(src: BinaryIO, name: str, compress: bool = True, kind: int = 0,
+           window: int = LZMA_WINDOW) -> tuple[Image.Image, Meta]:
+    """Build the image from a seekable binary stream, holding only the pixel buffer in memory.
+    window caps the LZMA window in bytes. An LZMA payload starts with one byte, log2 of the
+    window used, because a raw LZMA stream does not record it."""
+    total = src.seek(0, os.SEEK_END)
     src.seek(0)
     sha, size = hashlib.sha256(), 0
-    packed = co = None
-    packed_size = 0
+    packed = co = xz = xz_co = squeezed = None
+    win = 0
+    packed_size = xz_size = squeezed_size = 0
     if compress:
         packed, co = _spool(), zlib.compressobj(9)
-    while chunk := src.read(CHUNK):
-        sha.update(chunk)
-        size += len(chunk)
+        win = lzma_window(total, window)
+        xz, xz_co = _spool(), lzma.LZMACompressor(lzma.FORMAT_RAW, filters=lzma_filters(win))
+        xz_size = xz.write(bytes([win.bit_length() - 1]))
+    if kind & FLAG_DIR:  # tar padding is zeros
+        squeezed = _spool()
+    try:
+        while chunk := src.read(CHUNK):
+            sha.update(chunk)
+            size += len(chunk)
+            if co:
+                packed_size += packed.write(co.compress(chunk))
+                xz_size += xz.write(xz_co.compress(chunk))
+            if squeezed:
+                squeezed_size += squeezed.write(squeeze(chunk))
         if co:
-            packed_size += packed.write(co.compress(chunk))
-    flags = kind
-    if co:
-        packed_size += packed.write(co.flush())
-    if co and packed_size < size:
-        flags |= FLAG_ZLIB
-        payload, stored = packed, packed_size
-    else:
-        payload, stored = src, size
+            packed_size += packed.write(co.flush())
+            xz_size += xz.write(xz_co.flush())
+    except MemoryError as e:
+        raise ImageStoreError("not enough memory to " + (f"compress with a {win >> 20} MiB LZMA window" if win
+                                                         else "encode this"), "memory") from e
+    flags, payload, stored = kind, src, size
+    for flag, spool, n in ((FLAG_ZLIB, packed, packed_size), (FLAG_LZMA, xz, xz_size),
+                           (FLAG_SQUEEZE, squeezed, squeezed_size)):
+        if spool and n < stored:
+            flags, payload, stored = kind | flag, spool, n
 
     name_b = name.encode("utf-8")
     meta = Meta(name, flags, size, stored, sha.digest())
@@ -135,8 +206,9 @@ def encode(src: BinaryIO, name: str, compress: bool = True, kind: int = 0) -> tu
         if not n:
             raise ImageStoreError("source changed size while it was being encoded", "source_changed")
         pos += n
-    if packed:
-        packed.close()
+    for spool in (packed, xz, squeezed):
+        if spool:
+            spool.close()
     # RGBA maps the buffer in place instead of copying it
     return Image.frombuffer("RGBA", (width, height), buf, "raw", "RGBA", 0, 1), meta
 
@@ -201,6 +273,70 @@ def _inflate(chunks: Iterator[bytes], orig_size: int) -> Iterator[bytes]:
         raise ImageStoreError(f"corrupt compressed payload: {e}", "zlib") from e
 
 
+def _read_varint(buf: bytearray, pos: int) -> tuple[int, int] | None:
+    """(value, next position), or None while the number is still incomplete."""
+    value = shift = 0
+    for i in range(pos, min(len(buf), pos + 10)):
+        value |= (buf[i] & 0x7F) << shift
+        if not buf[i] & 0x80:
+            return value, i + 1
+        shift += 7
+    if len(buf) - pos >= 10:
+        raise ImageStoreError("corrupt squeezed payload: bad record length", "squeeze")
+    return None
+
+
+def _unlzma(chunks: Iterator[bytes], orig_size: int) -> Iterator[bytes]:
+    chunks = iter(chunks)
+    first = next(chunks, b"")
+    exp = first[0] if first else 0
+    if not 12 <= exp <= 30:
+        raise ImageStoreError("corrupt compressed payload: bad LZMA window", "zlib")
+    # a window larger than the data is never used, so a hostile header can't force a huge allocation
+    window = min(1 << exp, lzma_window(orig_size, LZMA_WINDOW_LIMIT))
+    d, left = lzma.LZMADecompressor(lzma.FORMAT_RAW, filters=lzma_filters(window)), orig_size
+    try:
+        for chunk in itertools.chain([first[1:]], chunks):
+            while left and not d.eof:
+                out = d.decompress(chunk, min(left, CHUNK))
+                chunk, left = b"", left - len(out)
+                if out:
+                    yield out
+                if d.needs_input:
+                    break
+    except lzma.LZMAError as e:
+        raise ImageStoreError(f"corrupt compressed payload: {e}", "zlib") from e
+
+
+def _unsqueeze(chunks: Iterator[bytes], orig_size: int) -> Iterator[bytes]:
+    """Inverse of squeeze. Output is capped at the declared size, like _inflate."""
+    buf, left = bytearray(), orig_size
+    zeros = lit = 0  # zero bytes still to write, literal bytes still to copy
+    for chunk in chunks:
+        buf += chunk
+        pos = 0
+        while left:
+            if zeros:
+                n = min(zeros, left, CHUNK)
+                zeros, left = zeros - n, left - n
+                yield bytes(n)
+            elif lit:
+                n = min(lit, left, len(buf) - pos)
+                if not n:
+                    break  # the rest of this literal is in the next chunk
+                lit, left = lit - n, left - n
+                yield bytes(buf[pos:pos + n])
+                pos += n
+            else:
+                head = _read_varint(buf, pos)
+                if head is None or (tail := _read_varint(buf, head[1])) is None:
+                    break
+                (zeros, _), (lit, pos) = head, tail
+        del buf[:pos]
+        if not left:
+            return
+
+
 def _verified(meta: Meta, chunks: Iterator[bytes]) -> Iterator[bytes]:
     sha, n = hashlib.sha256(), 0
     for chunk in chunks:
@@ -233,8 +369,16 @@ def decode(img: Image.Image) -> tuple[Meta, Iterator[bytes]]:
         raise ImageStoreError("image is truncated (payload extends past the pixel data)", "truncated")
     name = bytes(px.read(name_len)).decode("utf-8", errors="replace")
     meta = Meta(name, flags, orig, stored, digest)
+    if bin(flags & (FLAG_ZLIB | FLAG_LZMA | FLAG_SQUEEZE)).count("1") > 1:
+        raise ImageStoreError("header marks the payload as stored more than one way", "version")
     chunks = _payload(px, stored)
-    return meta, _verified(meta, _inflate(chunks, orig) if meta.compressed else chunks)
+    if flags & FLAG_ZLIB:
+        chunks = _inflate(chunks, orig)
+    elif flags & FLAG_LZMA:
+        chunks = _unlzma(chunks, orig)
+    elif meta.squeezed:
+        chunks = _unsqueeze(chunks, orig)
+    return meta, _verified(meta, chunks)
 
 
 def is_ignored(name: str) -> bool:
@@ -282,15 +426,61 @@ def scan_ignored(path: Path) -> tuple[list[Path], int, int]:
     return [h.path for h in hits], sum(h.files for h in hits), sum(h.size for h in hits)
 
 
+def _file_digest(path: Path) -> bytes | None:
+    sha = hashlib.sha256()
+    try:
+        with path.open("rb") as f:
+            while chunk := f.read(CHUNK):
+                sha.update(chunk)
+    except OSError:
+        return None
+    return sha.digest()
+
+
+@dataclass
+class PackStats:
+    """Filled in by pack_dir: files stored as pointers to an identical earlier file, and their bytes."""
+    duplicates: int = 0
+    duplicate_bytes: int = 0
+
+
+class _Seen:
+    """Regular files seen so far, by size, so a byte-identical later file can point at the first.
+    Only files that share a size are ever hashed."""
+
+    def __init__(self) -> None:
+        self.by_size: dict[int, list[list]] = {}  # size -> [arcname, path, digest or None]
+
+    def original_of(self, size: int, arcname: str, path: Path) -> str | None:
+        group = self.by_size.setdefault(size, [])
+        if not group:
+            group.append([arcname, path, None])
+            return None
+        digest = _file_digest(path)
+        if digest is None:
+            return None
+        for entry in group:
+            if entry[2] is None:
+                entry[2] = _file_digest(entry[1])
+            if entry[2] == digest:
+                return entry[0]
+        group.append([arcname, path, digest])
+        return None
+
+
 def pack_dir(path: Path, ignore: bool = False, exclude: Collection[str] | None = None,
-             on_entry: Callable[[tarfile.TarInfo], None] | None = None) -> tuple[BinaryIO, int]:
-    """Tar a folder into scratch space (uncompressed: zlib/PNG handle that). Returns (tar stream, file count).
+             on_entry: Callable[[tarfile.TarInfo], None] | None = None,
+             stats: PackStats | None = None) -> tuple[BinaryIO, int]:
+    """Tar a folder into scratch space (uncompressed: the payload encoders handle that). Returns (tar stream, file count).
 
     ignore skips every entry auto-ignore matches; exclude skips exactly the listed paths
     (POSIX, relative to the folder, as in IgnoreHit.rel), for a user-reviewed selection.
     on_entry is called for each entry kept (progress reporting; it may raise to abort).
+    A file identical to an earlier one is stored as a tar hard link to it, without its data
+    (counted in stats, when given).
     """
     files = 0
+    seen = _Seen()
     root = path.name or "folder"
     skip = frozenset(exclude or ())
 
@@ -303,6 +493,11 @@ def pack_dir(path: Path, ignore: bool = False, exclude: Collection[str] | None =
         if on_entry is not None:
             on_entry(ti)
         files += ti.isfile()
+        if ti.isreg() and ti.size and (first := seen.original_of(ti.size, ti.name, path / ti.name[len(root) + 1:])):
+            if stats:
+                stats.duplicates += 1
+                stats.duplicate_bytes += ti.size
+            ti.type, ti.linkname, ti.size = tarfile.LNKTYPE, first, 0
         ti.uid = ti.gid = 0  # don't leak local user/group names into the image
         ti.uname = ti.gname = ""
         return ti
@@ -311,6 +506,18 @@ def pack_dir(path: Path, ignore: bool = False, exclude: Collection[str] | None =
     with tarfile.open(fileobj=tmp, mode="w:") as tar:
         tar.add(path, arcname=root, filter=scrub)
     return tmp, files
+
+
+def _copy_pointer(member: tarfile.TarInfo, dest: Path) -> None:
+    """Restore a hard-link entry as an independent copy, so editing one file never changes another."""
+    m = tarfile.data_filter(member, str(dest))  # refuses targets outside dest
+    src, dst = Path(dest, m.linkname), Path(dest, m.name)
+    if not src.is_file():
+        raise tarfile.TarError(f"{m.name} points at {m.linkname}, which is not a file in the archive")
+    shutil.copyfile(src, dst)
+    if m.mode is not None:
+        os.chmod(dst, m.mode)
+    os.utime(dst, (m.mtime, m.mtime))
 
 
 def unpack_dir(chunks: Iterator[bytes], dest: Path) -> int:
@@ -324,8 +531,19 @@ def unpack_dir(chunks: Iterator[bytes], dest: Path) -> int:
         tmp.seek(0)
         try:
             with tarfile.open(fileobj=tmp, mode="r:") as tar:
-                files = sum(m.isfile() for m in tar.getmembers())
-                tar.extractall(dest, filter="data")
+                members = tar.getmembers()
+                files = sum(m.isfile() or m.islnk() for m in members)
+
+                def extractable() -> Iterator[tarfile.TarInfo]:
+                    # extractall pulls these lazily, so each pointer is copied right after its
+                    # original was written and before folder timestamps are applied at the end
+                    for m in members:
+                        if m.islnk():
+                            _copy_pointer(m, dest)
+                        else:
+                            yield m
+
+                tar.extractall(dest, members=extractable(), filter="data")
         except (tarfile.TarError, OSError) as e:
             raise ImageStoreError(f"cannot extract folder: {e}", "extract") from e
     return files
@@ -464,6 +682,8 @@ class EncodeResult:
     compress_requested: bool
     files: int = 0
     skipped: int = 0  # entries left out of a folder by review; -1 = auto-ignore on (not counted)
+    duplicates: int = 0  # folder files stored as pointers to an identical file
+    duplicate_bytes: int = 0  # what those files would have added to the archive
 
     @property
     def header_size(self) -> int:
@@ -481,7 +701,7 @@ class EncodeResult:
     def saved_fraction(self) -> float:
         """How much smaller the stored payload is than the original (0 when stored raw)."""
         m = self.meta
-        return 1 - m.stored_size / m.orig_size if m.orig_size and m.compressed else 0.0
+        return 1 - m.stored_size / m.orig_size if m.orig_size and (m.compressed or m.squeezed) else 0.0
 
 
 @dataclass
@@ -538,8 +758,9 @@ def _verify_png(path: Path, meta: Meta, task: Task) -> None:
 
 
 def encode_stream(data: BinaryIO, name: str, out: Path, *, compress: bool = True, force: bool = False,
+                  window: int = LZMA_WINDOW,
                   kind: int = 0, source: str = "", task: Task | None = None, verify: bool = True,
-                  files: int = 0, skipped: int = 0) -> EncodeResult:
+                  files: int = 0, skipped: int = 0, pack: PackStats | None = None) -> EncodeResult:
     """Encode a seekable stream to *out*: written to a temporary sibling, verified by decoding
     it again, and only then moved into place. Nothing is left behind on failure or cancel."""
     task = task or Task()
@@ -547,7 +768,7 @@ def encode_stream(data: BinaryIO, name: str, out: Path, *, compress: bool = True
     _check_output(out, force)
     total = data.seek(0, os.SEEK_END)
     data.seek(0)
-    img, meta = encode(_TrackedReader(data, task, total, compress), name, compress, kind)
+    img, meta = encode(_TrackedReader(data, task, total, compress), name, compress, kind, window)
     width, height = img.size
     task.phase("Writing PNG")
     tmp = out.with_name(f".{out.name}.imagestore-{os.getpid()}.part")
@@ -563,7 +784,7 @@ def encode_stream(data: BinaryIO, name: str, out: Path, *, compress: bool = True
         tmp.unlink(missing_ok=True)
         raise
     return EncodeResult(out, meta, width, height, out.stat().st_size, verify, source or name, compress,
-                        files, skipped)
+                        files, skipped, pack.duplicates if pack else 0, pack.duplicate_bytes if pack else 0)
 
 
 def portable_name(name: str) -> str:
@@ -577,6 +798,7 @@ def portable_name(name: str) -> str:
 
 
 def encode_path(src: Path, out: Path | None = None, *, compress: bool = True, force: bool = False,
+                window: int = LZMA_WINDOW,
                 ignore: bool = False, exclude: Collection[str] | None = None, task: Task | None = None,
                 verify: bool = True) -> EncodeResult:
     task = task or Task()
@@ -588,26 +810,28 @@ def encode_path(src: Path, out: Path | None = None, *, compress: bool = True, fo
         task.phase("Packing folder")  # done counts entries here, not bytes
         # -1: auto-ignore was on, but counting its hits would mean walking them; not worth it
         skipped = len(exclude) if exclude else (-1 if ignore else 0)
-        tar, files = pack_dir(src, ignore, exclude=exclude, on_entry=lambda _ti: task.advance(1))
+        pack = PackStats()
+        tar, files = pack_dir(src, ignore, exclude=exclude, on_entry=lambda _ti: task.advance(1), stats=pack)
         with tar:
-            return encode_stream(tar, portable_name(src.name) or "folder", out, compress=compress, force=force, kind=FLAG_DIR,
-                                 source=f"folder {src}", task=task, verify=verify, files=files, skipped=skipped)
+            return encode_stream(tar, portable_name(src.name) or "folder", out, compress=compress, force=force, window=window, kind=FLAG_DIR,
+                                 source=f"folder {src}", task=task, verify=verify, files=files, skipped=skipped, pack=pack)
     if src.is_file():
         out = Path(out) if out else default_png_path(src)
         _check_output(out, force)
         with src.open("rb") as f:
-            return encode_stream(f, portable_name(src.name), out, compress=compress, force=force, source=str(src), task=task,
+            return encode_stream(f, portable_name(src.name), out, compress=compress, force=force, window=window, source=str(src), task=task,
                                  verify=verify)
     raise ImageStoreError(f"no such file or folder: {src}", "missing")
 
 
 def encode_text(text: str, out: Path | None = None, *, compress: bool = True, force: bool = False,
+                window: int = LZMA_WINDOW,
                 task: Task | None = None, verify: bool = True) -> EncodeResult:
     try:
         data = text.encode("utf-8")
     except UnicodeEncodeError as e:
         raise ImageStoreError(f"the text cannot be encoded as UTF-8: {e}", "text") from e
-    return encode_stream(io.BytesIO(data), TEXT_NAME, Path(out or "text.png"), compress=compress,
+    return encode_stream(io.BytesIO(data), TEXT_NAME, Path(out or "text.png"), compress=compress, window=window,
                          force=force, kind=FLAG_TEXT, source=f"text ({len(text):,} chars)", task=task, verify=verify)
 
 
@@ -747,9 +971,16 @@ _EXPLAIN = {
                   "The header promises more data than the image holds. The PNG was probably cropped, "
                   "resized or only partly copied."),
     "zlib": ("Compressed payload is corrupted",
-             "The zlib stream inside the image could not be decompressed. Pixel values changed after "
+             "The zlib or LZMA stream inside the image could not be decompressed. Pixel values changed after "
              "encoding (lossy re-compression, colour management or alpha premultiplication). Nothing is "
              "written when this check fails."),
+    "memory": ("Not enough memory to compress",
+               "The LZMA window asked for needs more RAM than is available. Choose a smaller window "
+               "(--window in the CLI) or turn compression off. Nothing was written."),
+    "squeeze": ("Packed folder data is corrupted",
+                "The zero-run encoding inside the image is malformed. Pixel values changed after "
+                "encoding (lossy re-compression, colour management or alpha premultiplication). Nothing is "
+                "written when this check fails."),
     "size": ("Integrity check failed (size mismatch)",
              "The payload decoded to a different length than the header records, so the pixels were "
              "altered. Nothing is written when this check fails."),
@@ -898,9 +1129,11 @@ class _CliProgress:
 def _payload_line(r: EncodeResult) -> str:
     m = r.meta
     if m.compressed:
-        return f"{human(m.stored_size)}  [dim]zlib ·[/] [green]{r.saved_fraction:.1%} smaller[/]"
+        return f"{human(m.stored_size)}  [dim]{m.method} ·[/] [green]{r.saved_fraction:.1%} smaller[/]"
+    if m.squeezed:
+        return f"{human(m.stored_size)}  [dim]zero padding removed ·[/] [green]{r.saved_fraction:.1%} smaller[/]"
     if r.compress_requested:
-        return f"{human(m.stored_size)}  [dim]raw · zlib would not have made it smaller[/]"
+        return f"{human(m.stored_size)}  [dim]raw · compression would not have made it smaller[/]"
     return f"{human(m.stored_size)}  [dim]raw · compression off[/]"
 
 
@@ -918,6 +1151,8 @@ def render_encode(r: EncodeResult) -> None:
         ("Output", escape(show_path(r.out))),
         ("Original", human(m.orig_size)),
         ("Stored", _payload_line(r)),
+        *([("Duplicates", f"{r.duplicates:,} identical {'file' if r.duplicates == 1 else 'files'} stored once  "
+                          f"[dim]· {human(r.duplicate_bytes)} not stored[/]")] if r.duplicates else []),
         ("PNG file", f"{human(r.png_size)} on disk"),
         ("Image", f"{r.width} × {r.height} px RGBA  [dim]· {r.width * r.height:,} pixels · "
                   f"{human(r.padding)} padding[/]"),
@@ -968,12 +1203,13 @@ def render_inspect(r: InspectResult) -> None:
         ("Type", _kind_text(m)),
         ("Original", human(m.orig_size)),
         ("Stored", f"{human(m.stored_size)}  [dim]" + (
-            f"zlib · {1 - m.stored_size / m.orig_size:.1%} smaller" if m.compressed and m.orig_size else "raw")
+            f"{m.method} · {1 - m.stored_size / m.orig_size:.1%} smaller"
+            if (m.compressed or m.squeezed) and m.orig_size else "raw")
          + "[/]"),
         ("Capacity", f"{human(r.capacity)} across {r.width * r.height:,} pixels  "
                      f"[dim]({used / r.capacity:.1%} used)[/]" if r.capacity else "0 B"),
         ("Format", f"[dim]v{VERSION} · flags 0x{m.flags:02x}"
-                   f"{' (' + ', '.join(n for f, n in ((FLAG_ZLIB, 'zlib'), (FLAG_TEXT, 'text'), (FLAG_DIR, 'folder')) if m.flags & f) + ')' if m.flags else ''}[/]"),
+                   f"{' (' + ', '.join(n for f, n in ((FLAG_ZLIB, 'zlib'), (FLAG_LZMA, 'lzma'), (FLAG_TEXT, 'text'), (FLAG_DIR, 'folder'), (FLAG_SQUEEZE, 'squeezed')) if m.flags & f) + ')' if m.flags else ''}[/]"),
         ("SHA-256", f"[dim]{m.digest.hex()}[/]  [dim](stored)[/]"),
     ]
     if r.ok:
@@ -1036,21 +1272,22 @@ def ask_ignore(src: Path) -> tuple[bool, set[str] | None]:
 
 
 def do_encode(src: Path, out: Path | None, compress: bool, force: bool,
-              ignore: bool | None = None, verify: bool = True) -> EncodeResult:
+              ignore: bool | None = None, verify: bool = True, window: int = LZMA_WINDOW) -> EncodeResult:
     """ignore: True/False decides auto-ignore for folders; None asks."""
     exclude = None
     if ignore is None:
         ignore, exclude = ask_ignore(Path(src).resolve()) if Path(src).is_dir() else (False, None)
     with _CliProgress() as task:
         result = encode_path(src, out, compress=compress, force=force, ignore=ignore, exclude=exclude, task=task,
-                             verify=verify)
+                             verify=verify, window=window)
     render_encode(result)
     return result
 
 
-def do_encode_text(text: str, out: Path | None, compress: bool, force: bool, verify: bool = True) -> EncodeResult:
+def do_encode_text(text: str, out: Path | None, compress: bool, force: bool, verify: bool = True,
+                   window: int = LZMA_WINDOW) -> EncodeResult:
     with _CliProgress() as task:
-        result = encode_text(text, out, compress=compress, force=force, task=task, verify=verify)
+        result = encode_text(text, out, compress=compress, force=force, window=window, task=task, verify=verify)
     render_encode(result)
     return result
 
@@ -1193,7 +1430,7 @@ def _interactive_encode(here: Path) -> Path:
     if picked is None:
         return src.parent
     out, force = picked
-    compress = Confirm.ask("Compress with zlib first? [dim](kept only if it makes the payload smaller)[/]",
+    compress = Confirm.ask("Compress first? [dim](kept only if it makes the payload smaller)[/]",
                            default=True)
     with _CliProgress() as task:
         result = encode_path(src, out, compress=compress, force=force, ignore=ignore, exclude=exclude, task=task)
@@ -1213,7 +1450,7 @@ def _interactive_text() -> None:
     if picked is None:
         return
     out, force = picked
-    compress = Confirm.ask("Compress with zlib first?", default=True)
+    compress = Confirm.ask("Compress first?", default=True)
     do_encode_text(text, out, compress, force)
 
 
@@ -1222,7 +1459,7 @@ def _interactive_decode(here: Path) -> Path:
     with console.status("Reading header…"):
         _, meta = read_header(src)
     console.print(f"[dim]Contains[/] {_kind_text(meta)} [dim]· {human(meta.orig_size)}"
-                  f"{' · zlib' if meta.compressed else ''}[/]")
+                  f"{' · ' + meta.method if meta.method != 'raw' else ''}[/]")
     if meta.is_text:
         do_decode(src, None, False)
         return src.parent
@@ -1286,6 +1523,16 @@ def launch_gui() -> int:
     return imagestore_gui.run()
 
 
+def _window_mib(text: str) -> int:
+    try:
+        mib = int(text)
+    except ValueError:
+        mib = 0
+    if not 1 <= mib <= LZMA_WINDOW_LIMIT >> 20:
+        raise argparse.ArgumentTypeError("must be a whole number of MiB from 1 to 1024")
+    return mib << 20
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="imagestore", description=f"Serialize files into RGBA PNG images. {TAGLINE}",
                                  epilog="Run without arguments in a terminal for the interactive menu.")
@@ -1296,7 +1543,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("file", type=Path, nargs="?", help="file or folder to encode (or use -t)")
     p.add_argument("-t", "--text", help="encode this string instead of a file")
     p.add_argument("-o", "--output", type=Path, help="output PNG (default: <file>.png, or text.png)")
-    p.add_argument("--no-compress", action="store_true", help="skip zlib pre-compression")
+    p.add_argument("--no-compress", action="store_true", help="skip zlib/LZMA pre-compression")
+    p.add_argument("--window", type=_window_mib, default=LZMA_WINDOW, metavar="MiB",
+                   help="cap on the LZMA window, 1-1024 MiB (default 64; rounded up to a power of two; "
+                        "encoding needs about 7x this in RAM). Larger only helps when repeats are far apart")
     p.add_argument("-f", "--force", action="store_true", help="overwrite existing output")
     p.add_argument("--no-verify", action="store_true",
                    help="skip decoding the written PNG to confirm it (faster, not recommended)")
@@ -1327,12 +1577,14 @@ def main(argv: list[str] | None = None) -> int:
             if (args.file is None) == (args.text is None):
                 ap.error("encode needs exactly one of FILE or -t TEXT")
             if args.text is not None:
-                do_encode_text(args.text, args.output, not args.no_compress, args.force, not args.no_verify)
+                do_encode_text(args.text, args.output, not args.no_compress, args.force, not args.no_verify,
+                                 window=args.window)
             else:
                 # ask only when someone is there to answer; scripts get exact, unfiltered folders
                 ignore = True if args.auto_ignore else False if args.no_auto_ignore else (
                     None if sys.stdin.isatty() else False)
-                do_encode(args.file, args.output, not args.no_compress, args.force, ignore, not args.no_verify)
+                do_encode(args.file, args.output, not args.no_compress, args.force, ignore, not args.no_verify,
+                          window=args.window)
         elif args.cmd == "decode":
             do_decode(args.image, args.output_dir, args.force)
         elif args.cmd == "info":

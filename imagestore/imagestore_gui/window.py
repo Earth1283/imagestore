@@ -9,6 +9,7 @@ from PyQt6.QtCore import QSettings, QSize, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QAction, QActionGroup, QDesktopServices, QGuiApplication, QKeySequence
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -177,6 +178,9 @@ class Page(QWidget):
 # --------------------------------------------------------------------------- encode
 
 
+WINDOW_CHOICES = (1, 4, 16, 64, 256, 1024)  # MiB
+
+
 class EncodePage(Page):
     title_text = "Encode"
     subtitle_text = "Turn a file, a folder or some text into a lossless RGBA PNG. Every byte is recoverable."
@@ -294,12 +298,31 @@ class EncodePage(Page):
         lay.addWidget(self.overwrite)
         lay.addWidget(self._divider())
         lay.addWidget(label("Options", "section"))
-        self.compress = QCheckBox("Compress with zlib first")
+        self.compress = QCheckBox("Compress first (zlib or LZMA)")
         self.compress.setChecked(self.settings.value("compress", True, type=bool))
         self.compress.toggled.connect(lambda on: self.settings.setValue("compress", on))
         lay.addWidget(self.compress)
         lay.addWidget(self._indent(label("Kept only when it makes the payload smaller; already-compressed data is "
                                          "stored raw.", "faint", wrap=True)))
+        self.window_size = QComboBox()
+        self.window_size.setAccessibleName("LZMA window size")
+        for mib in WINDOW_CHOICES:
+            self.window_size.addItem(f"{mib} MiB" + ("  (default)" if mib == core.LZMA_WINDOW >> 20 else ""), mib)
+        saved = self.settings.value("window_mib", core.LZMA_WINDOW >> 20, type=int)
+        self.window_size.setCurrentIndex(max(0, self.window_size.findData(saved)))
+        self.window_size.currentIndexChanged.connect(lambda _: self.settings.setValue("window_mib", self.window_mib()))
+        self.compress.toggled.connect(self.window_size.setEnabled)
+        self.window_size.setEnabled(self.compress.isChecked())
+        row = QHBoxLayout()
+        row.addWidget(label("LZMA window", "key"))
+        row.addWidget(self.window_size)
+        row.addStretch(1)
+        holder = QWidget()
+        holder.setLayout(row)
+        lay.addWidget(self._indent(holder))
+        lay.addWidget(self._indent(label("How far back LZMA looks for repeats. A larger window can shrink big "
+                                         "folders with far-apart repeats but needs about 7× its size in RAM while "
+                                         "encoding. Small inputs never use more than they need.", "faint", wrap=True)))
         self.verify = QCheckBox("Verify after writing")
         self.verify.setChecked(True)
         lay.addWidget(self.verify)
@@ -312,6 +335,10 @@ class EncodePage(Page):
         line = QFrame()
         line.setProperty("role", "divider")
         return line
+
+    def window_mib(self) -> int:
+        """The chosen LZMA window cap in MiB."""
+        return self.window_size.currentData()
 
     @staticmethod
     def _indent(widget: QWidget) -> QWidget:
@@ -328,7 +355,7 @@ class EncodePage(Page):
         self.tiles = {}
         for i, (key, caption) in enumerate((("orig", "Original"), ("stored", "Stored payload"), ("png", "PNG file"),
                                             ("ratio", "Compression"), ("dims", "Dimensions"), ("pixels", "Pixels"),
-                                            ("padding", "Padding"), ("check", "Checksum"))):
+                                            ("padding", "Padding"), ("check", "Checksum"), ("dupes", "Duplicates"))):
             tile = StatTile(caption)
             self.tiles[key] = tile
             grid.addWidget(tile, i // 4, i % 4)
@@ -550,7 +577,7 @@ class EncodePage(Page):
         self.banner.hide()
         self.result_card.hide()
         self.progress.begin()
-        common = dict(compress=self.compress.isChecked(), force=self.overwrite.isChecked(),
+        common = dict(compress=self.compress.isChecked(), window=self.window_mib() << 20, force=self.overwrite.isChecked(),
                       verify=self.verify.isChecked())
         if self.kind.value() == "text":
             self.runner.start(core.encode_text, self.text.toPlainText(), out, **common)
@@ -570,15 +597,19 @@ class EncodePage(Page):
                                  f"{core.show_path(r.out)}")
         t = self.tiles
         t["orig"].set(core.human(m.orig_size), f"{m.orig_size:,} bytes")
-        t["stored"].set(core.human(m.stored_size), "zlib" if m.compressed else "raw")
+        t["stored"].set(core.human(m.stored_size), "zero padding removed" if m.squeezed else m.method)
         t["png"].set(core.human(r.png_size), f"{r.png_size:,} bytes")
-        if m.compressed:
+        if m.compressed or m.squeezed:
             t["ratio"].set(f"{r.saved_fraction:.1%}", "smaller than the original")
         else:
-            t["ratio"].set("None", "zlib would not shrink it" if r.compress_requested else "compression off")
+            t["ratio"].set("None", "compression would not shrink it" if r.compress_requested else "compression off")
         t["dims"].set(f"{r.width} × {r.height}", "RGBA, 8-bit")
         t["pixels"].set(f"{r.width * r.height:,}", "4 bytes each")
         t["padding"].set(core.human(r.padding), "zero bytes after the payload")
+        t["dupes"].setVisible(bool(r.duplicates))
+        if r.duplicates:
+            t["dupes"].set(f"{r.duplicates:,} {'file' if r.duplicates == 1 else 'files'}",
+                           f"identical to another · {core.human(r.duplicate_bytes)} not stored")
         t["check"].set("✓ Match" if r.verified else "Skipped", "SHA-256 re-checked" if r.verified else "")
         t["check"].value.setStyleSheet(f"color: {style.tokens()['success' if r.verified else 'warning']};")
         self.size_bars.set_sizes([("Original", m.orig_size, "text_faint"), ("Stored", m.stored_size, "accent"),
@@ -708,7 +739,7 @@ class DecodePage(Page):
         what = "text" if meta.is_text else f"{kind} “{meta.name}”"
         self.source_card.show_source(
             {"text": "text", "folder": "folder", "file": "file"}[kind], self.image.name,
-            f"Contains {what} · {core.human(meta.orig_size)}{' · zlib' if meta.compressed else ''} · "
+            f"Contains {what} · {core.human(meta.orig_size)}{' · ' + meta.method if meta.method != 'raw' else ''} · "
             f"{w}×{h} px, {core.human(size)} PNG")
         self.text_options.setVisible(meta.is_text)
         self.options.show()
@@ -907,15 +938,16 @@ class InspectPage(Page):
             g.add("Contents", "text string" if m.is_text else f"{'folder' if m.is_dir else 'file'} “{m.name}”")
             g.add("Original size", f"{core.human(m.orig_size)} ({m.orig_size:,} bytes)")
             stored = f"{core.human(m.stored_size)} ({m.stored_size:,} bytes)"
-            if m.compressed and m.orig_size:
-                stored += f" · zlib, {1 - m.stored_size / m.orig_size:.1%} smaller"
+            if (m.compressed or m.squeezed) and m.orig_size:
+                stored += f" · {m.method}, {1 - m.stored_size / m.orig_size:.1%} smaller"
             else:
                 stored += " · raw"
             g.add("Stored payload", stored)
             if r.capacity:
                 g.add("Capacity", f"{core.human(r.capacity)} in {r.width * r.height:,} pixels · "
                                   f"{used / r.capacity:.1%} used, {core.human(r.capacity - used)} padding")
-            flags = [n for f, n in ((core.FLAG_ZLIB, "zlib"), (core.FLAG_TEXT, "text"), (core.FLAG_DIR, "folder"))
+            flags = [n for f, n in ((core.FLAG_ZLIB, "zlib"), (core.FLAG_LZMA, "lzma"), (core.FLAG_TEXT, "text"), (core.FLAG_DIR, "folder"),
+                                      (core.FLAG_SQUEEZE, "squeezed"))
                      if m.flags & f]
             g.add("Format", f"ImageStore v{core.VERSION} · flags 0x{m.flags:02x}"
                             + (f" ({', '.join(flags)})" if flags else ""))

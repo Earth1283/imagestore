@@ -56,7 +56,8 @@ moved into place. `--no-verify` skips the check.
 |---|---|---|
 | `encode` | `-o, --output PATH` | Output PNG (default `<file>.png`, or `text.png` with `-t`) |
 | `encode` | `-t, --text TEXT` | Encode a string instead of a file |
-| `encode` | `--no-compress` | Skip zlib pre-compression |
+| `encode` | `--no-compress` | Skip zlib/LZMA pre-compression |
+| `encode` | `--window MiB` | Cap on the LZMA window, 1-1024 (default 64, rounded up to a power of two). Encoding needs about 7x this in RAM; a larger window only helps when repeats are far apart. The GUI has the same setting. |
 | `encode` | `-f, --force` | Overwrite an existing output |
 | `encode` | `--no-verify` | Skip decoding the written PNG to confirm it (faster, not recommended) |
 | `encode` | `--auto-ignore` / `--no-auto-ignore` | Folders: skip (or keep) junk such as `.DS_Store`, `node_modules`, `__pycache__`, `.git`, `.venv`. By default it asks when run interactively and includes everything when scripted. |
@@ -75,14 +76,14 @@ error or failed integrity check, `130` interrupted.
 
 ## How it works
 
-The image is a header followed by the (optionally zlib-compressed) payload, written
+The image is a header followed by the (optionally compressed) payload, written
 row-major into RGBA bytes. The image is made roughly square, and the unused tail is zero
 padding.
 
 ```
 >4s   magic          "IMST"
 B     version        2
-B     flags          0x01 zlib, 0x02 text, 0x04 folder (tar)
+B     flags          0x01 zlib, 0x02 text, 0x04 folder (tar), 0x08 zero-run squeezed, 0x10 LZMA
 Q     original size
 Q     stored size
 32s   SHA-256 of the original bytes
@@ -92,7 +93,23 @@ H     name length
 ```
 
 Encoding streams the source in 1 MiB chunks and keeps only the pixel buffer in memory.
-Compression is used only when it actually makes the payload smaller.
+The payload is stored raw, zlib-compressed or LZMA-compressed, whichever is smallest; compression is
+used only when it actually makes the payload smaller. LZMA usually wins on text and source code
+(about 25% smaller than zlib on a code folder) and costs a few times the CPU of zlib. Its window is sized from the original size (the next power
+of two) and capped by `--window` (64 MiB by default), so repeats far apart in a large archive are
+still found; encoding a large folder can use around 0.5 GB of RAM at the default, decoding far
+less. The window is recorded as the first byte of an LZMA payload.
+
+Folders are tarred first, and tar pads every entry to a 512-byte block, so a folder with many
+small files in nested subfolders is mostly zeros. zlib hides that, but when it is off (or does
+not win) those zeros would become empty pixels. Folder payloads are therefore also *squeezed*:
+each run of 8 or more zero bytes is replaced by its length (flag `0x08`), and whichever of
+raw, zlib, LZMA and squeezed is smallest is stored. Images made before this change still decode.
+
+Folders also deduplicate: a file byte-identical to an earlier one (same size, same SHA-256)
+is stored as a tar hard link to that file, with no data of its own. Decoding restores it as an
+independent copy with its own timestamp and permissions, never as a real hard link. Links that
+point outside the folder or at something that is not a file are refused.
 
 ## Caveats
 
