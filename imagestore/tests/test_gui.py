@@ -266,3 +266,58 @@ def test_window_choice_is_used_remembered_and_follows_compress(app, window, tmp_
 
     assert seen["window"] == 1 << 20
     assert page.settings.value("window_mib", type=int) == 1
+
+
+def test_error_correction_option_is_used_explained_and_remembered(app, window, tmp_path):
+    page = window.encode_page
+    assert page.ecc.value() == 0 and "cannot be repaired" in page.ecc_note.text()
+    page.ecc.setValue(25)
+    assert "25.1%" in page.ecc_note.text() and "12.5%" in page.ecc_note.text()
+    assert page.settings.value("ecc_percent", type=int) == 25
+
+    src = tmp_path / "a.txt"
+    src.write_text("hello " * 5000)
+    page.set_source(src)
+    page.compress.setChecked(False)
+    page.primary()
+    wait(app, page)
+    assert not page.tiles["ecc"].isHidden()
+    assert page.tiles["ecc"].value.text() == "25.1%"
+    page.compress.setChecked(True)
+
+    page.ecc.setValue(0)
+    page.set_source(src)
+    page.overwrite.setChecked(True)
+    page.primary()
+    wait(app, page)
+    assert page.tiles["ecc"].isHidden()
+
+
+def test_decode_and_inspect_show_repairs(app, window, tmp_path):
+    from PIL import Image
+    src = tmp_path / "a.bin"
+    src.write_bytes(random.Random(8).randbytes(40_000))
+    png = tmp_path / "a.png"
+    imagestore.encode_path(src, png, ecc=25, compress=False)
+    with Image.open(png) as im:
+        raw, size = bytearray(im.tobytes()), im.size
+    for i in range(len(raw) // 5, len(raw) // 5 + len(raw) // 20):
+        raw[i] ^= 0xFF
+    bad = tmp_path / "bad.png"
+    Image.frombytes("RGBA", size, bytes(raw)).save(bad)
+
+    inspect = window.inspect_page
+    window.inspect_file(bad)
+    wait(app, inspect)
+    assert "Repaired" in inspect.grid.values["Error correction"].text()
+    assert inspect.banner.title.text() == "Integrity verified"
+
+    decode = window.decode_page
+    decode.handle_paths([bad])
+    wait(app, decode)
+    decode.dest.setText(str(tmp_path / "out"))
+    decode.refresh()
+    decode.primary()
+    wait(app, decode)
+    assert "repaired" in decode.banner.hint.text()
+    assert (tmp_path / "out" / "a.bin").read_bytes() == src.read_bytes()

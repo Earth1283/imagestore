@@ -22,9 +22,11 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QSpinBox,
     QRadioButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QStackedWidget,
     QTreeWidget,
     QTreeWidgetItem,
@@ -314,15 +316,34 @@ class EncodePage(Page):
         self.compress.toggled.connect(self.window_size.setEnabled)
         self.window_size.setEnabled(self.compress.isChecked())
         row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(label("LZMA window", "key"))
         row.addWidget(self.window_size)
         row.addStretch(1)
         holder = QWidget()
         holder.setLayout(row)
         lay.addWidget(self._indent(holder))
+        self.ecc = QSpinBox()
+        self.ecc.setAccessibleName("Error correction, percent of extra space")
+        self.ecc.setRange(0, 50)
+        self.ecc.setSuffix(" %")
+        self.ecc.setSpecialValueText("Off")
+        self.ecc.setValue(min(50, max(0, self.settings.value("ecc_percent", 0, type=int))))
+        self.ecc_note = label("", "faint", wrap=True)
+        self.ecc.valueChanged.connect(self._ecc_changed)
+        self._ecc_changed(self.ecc.value())
         lay.addWidget(self._indent(label("How far back LZMA looks for repeats. A larger window can shrink big "
                                          "folders with far-apart repeats but needs about 7× its size in RAM while "
                                          "encoding. Small inputs never use more than they need.", "faint", wrap=True)))
+        ecc_row = QHBoxLayout()
+        ecc_row.setContentsMargins(0, 0, 0, 0)
+        ecc_row.addWidget(label("Error correction", "key"))
+        ecc_row.addWidget(self.ecc)
+        ecc_row.addStretch(1)
+        holder = QWidget()
+        holder.setLayout(ecc_row)
+        lay.addWidget(holder)
+        lay.addWidget(self.ecc_note)
         self.verify = QCheckBox("Verify after writing")
         self.verify.setChecked(True)
         lay.addWidget(self.verify)
@@ -335,6 +356,15 @@ class EncodePage(Page):
         line = QFrame()
         line.setProperty("role", "divider")
         return line
+
+    def _ecc_changed(self, percent: int) -> None:
+        self.settings.setValue("ecc_percent", percent)
+        if not percent:
+            self.ecc_note.setText("Off. If some pixels are damaged later, the image cannot be repaired.")
+            return
+        e = core.EccReport(core.ecc_parity_bytes(percent), 0)
+        self.ecc_note.setText(f"Adds about {e.overhead:.1%} to the image and repairs damage to up to "
+                              f"{e.tolerance:.1%} of it. Encoding and opening take longer.")
 
     def window_mib(self) -> int:
         """The chosen LZMA window cap in MiB."""
@@ -352,10 +382,11 @@ class EncodePage(Page):
         self.result_card, lay = card()
         grid = QGridLayout()
         grid.setSpacing(10)
+        self.tile_grid = grid
         self.tiles = {}
         for i, (key, caption) in enumerate((("orig", "Original"), ("stored", "Stored payload"), ("png", "PNG file"),
                                             ("ratio", "Compression"), ("dims", "Dimensions"), ("pixels", "Pixels"),
-                                            ("padding", "Padding"), ("check", "Checksum"), ("dupes", "Duplicates"))):
+                                            ("padding", "Padding"), ("check", "Checksum"), ("dupes", "Duplicates"), ("ecc", "Error correction"))):
             tile = StatTile(caption)
             self.tiles[key] = tile
             grid.addWidget(tile, i // 4, i % 4)
@@ -577,7 +608,7 @@ class EncodePage(Page):
         self.banner.hide()
         self.result_card.hide()
         self.progress.begin()
-        common = dict(compress=self.compress.isChecked(), window=self.window_mib() << 20, force=self.overwrite.isChecked(),
+        common = dict(compress=self.compress.isChecked(), window=self.window_mib() << 20, ecc=self.ecc.value(), force=self.overwrite.isChecked(),
                       verify=self.verify.isChecked())
         if self.kind.value() == "text":
             self.runner.start(core.encode_text, self.text.toPlainText(), out, **common)
@@ -606,7 +637,14 @@ class EncodePage(Page):
         t["dims"].set(f"{r.width} × {r.height}", "RGBA, 8-bit")
         t["pixels"].set(f"{r.width * r.height:,}", "4 bytes each")
         t["padding"].set(core.human(r.padding), "zero bytes after the payload")
-        t["dupes"].setVisible(bool(r.duplicates))
+        if m.ecc:
+            t["ecc"].set(f"{m.ecc.overhead:.1%}", f"repairs up to ~{m.ecc.tolerance:.1%} damage")
+        extras = [key for key, shown in (("dupes", r.duplicates), ("ecc", m.ecc)) if shown]
+        for key in ("dupes", "ecc"):  # the tiles that only sometimes apply fill the last row from the left
+            self.tile_grid.removeWidget(t[key])
+            t[key].setVisible(key in extras)
+        for n, key in enumerate(extras):
+            self.tile_grid.addWidget(t[key], 2, n)
         if r.duplicates:
             t["dupes"].set(f"{r.duplicates:,} {'file' if r.duplicates == 1 else 'files'}",
                            f"identical to another · {core.human(r.duplicate_bytes)} not stored")
@@ -812,6 +850,12 @@ class DecodePage(Page):
         self.status.emit("Decoding…")
         self.refresh()
 
+    @staticmethod
+    def _repair_note(m) -> str:
+        if m.ecc and m.ecc.repaired_bytes:
+            return f" Error correction repaired {m.ecc.repaired_bytes:,} damaged bytes."
+        return ""
+
     def _finished(self, r) -> None:
         super()._finished(r)
         m = r.meta
@@ -819,16 +863,20 @@ class DecodePage(Page):
         self._last_out = r.out
         if r.out is None:
             self.banner.show_message("ok", "Text decoded and verified",
-                                     f"{m.orig_size:,} bytes; the SHA-256 matches the one stored at encode time.")
+                                     f"{m.orig_size:,} bytes; the SHA-256 matches the one stored at encode time."
+                                     + self._repair_note(m))
             self.text_view.setPlainText(r.text or "")
             self.result_grid.add("SHA-256", m.digest.hex(), mono=True)
         else:
             self.banner.show_message("ok", "Restored and verified",
-                                     "The SHA-256 matched before anything was written.")
+                                     "The SHA-256 matched before anything was written." + self._repair_note(m))
             self.result_grid.add("Restored to", str(r.out) + ("/" if m.is_dir else ""))
             self.result_grid.add("Size", f"{core.human(m.orig_size)} ({m.orig_size:,} bytes)"
                                  + (f" · {r.files:,} files" if m.is_dir else ""))
             self.result_grid.add("SHA-256", m.digest.hex(), mono=True)
+            if m.ecc:
+                text, tone = core.ecc_summary(m.ecc)
+                self.result_grid.add("Error correction", text, tone=tone)
             self.result_grid.add("Integrity", "✓ verified", tone="success")
         self.text_view.setVisible(r.out is None)
         self.copy_btn.setVisible(r.out is None)
@@ -944,10 +992,16 @@ class InspectPage(Page):
                 stored += " · raw"
             g.add("Stored payload", stored)
             if r.capacity:
+                parity = m.ecc.blocks * m.ecc.parity if m.ecc else 0
                 g.add("Capacity", f"{core.human(r.capacity)} in {r.width * r.height:,} pixels · "
-                                  f"{used / r.capacity:.1%} used, {core.human(r.capacity - used)} padding")
+                                  f"{used / r.capacity:.1%} used, "
+                                  + (f"{parity / r.capacity:.1%} error correction, " if parity else "")
+                                  + f"{core.human(r.capacity - used - parity)} padding")
+            if m.ecc:
+                text, tone = core.ecc_summary(m.ecc)
+                g.add("Error correction", text, tone=tone or None)
             flags = [n for f, n in ((core.FLAG_ZLIB, "zlib"), (core.FLAG_LZMA, "lzma"), (core.FLAG_TEXT, "text"), (core.FLAG_DIR, "folder"),
-                                      (core.FLAG_SQUEEZE, "squeezed"))
+                                      (core.FLAG_SQUEEZE, "squeezed"), (core.FLAG_ECC, "ecc"))
                      if m.flags & f]
             g.add("Format", f"ImageStore v{core.VERSION} · flags 0x{m.flags:02x}"
                             + (f" ({', '.join(flags)})" if flags else ""))

@@ -27,6 +27,7 @@ import tarfile
 import tempfile
 import threading
 import zlib
+import functools
 from collections.abc import Callable, Collection, Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -47,6 +48,7 @@ FLAG_TEXT = 0x02  # payload is UTF-8 text: decode prints it instead of writing a
 FLAG_DIR = 0x04   # payload is an uncompressed tar of a folder
 FLAG_SQUEEZE = 0x08  # payload has its zero runs squeezed out (folders only)
 FLAG_LZMA = 0x10  # payload is a raw LZMA2 stream
+FLAG_ECC = 0x20  # the pixels are interleaved Reed-Solomon codewords (see the error correction section)
 # magic, version, flags, original size, stored size, sha256 of original, name length
 HEADER = struct.Struct(">4sBBQQ32sH")
 TEXT_NAME = "text.txt"
@@ -79,12 +81,32 @@ class Cancelled(ImageStoreError):
 
 
 @dataclass
+class EccReport:
+    """Error correction in an image: its strength, and what decoding had to repair."""
+    parity: int  # parity bytes per 255-byte block
+    blocks: int
+    repaired_bytes: int = 0
+    repaired_blocks: int = 0
+    failed_blocks: int = 0  # damaged beyond repair
+
+    @property
+    def overhead(self) -> float:
+        return self.parity / ECC_BLOCK
+
+    @property
+    def tolerance(self) -> float:
+        """Share of the image that can be damaged and still be repaired."""
+        return self.parity // 2 / ECC_BLOCK
+
+
+@dataclass
 class Meta:
     name: str
     flags: int
     orig_size: int
     stored_size: int
     digest: bytes
+    ecc: EccReport | None = None  # not part of the header: set from the pixels while encoding/decoding
 
     @property
     def compressed(self) -> bool:
@@ -152,10 +174,11 @@ def squeeze(chunk: bytes) -> bytes:
 
 
 def encode(src: BinaryIO, name: str, compress: bool = True, kind: int = 0,
-           window: int = LZMA_WINDOW) -> tuple[Image.Image, Meta]:
+           window: int = LZMA_WINDOW, ecc: int = 0, task: Task | None = None) -> tuple[Image.Image, Meta]:
     """Build the image from a seekable binary stream, holding only the pixel buffer in memory.
     window caps the LZMA window in bytes. An LZMA payload starts with one byte, log2 of the
-    window used, because a raw LZMA stream does not record it."""
+    window used, because a raw LZMA stream does not record it. ecc is the parity bytes per
+    255-byte block (0 = none; see ecc_parity_bytes)."""
     total = src.seek(0, os.SEEK_END)
     src.seek(0)
     sha, size = hashlib.sha256(), 0
@@ -190,16 +213,25 @@ def encode(src: BinaryIO, name: str, compress: bool = True, kind: int = 0,
         if spool and n < stored:
             flags, payload, stored = kind | flag, spool, n
 
+    if ecc:
+        flags |= FLAG_ECC
     name_b = name.encode("utf-8")
     meta = Meta(name, flags, size, stored, sha.digest())
     head = HEADER.pack(MAGIC, VERSION, flags, size, stored, meta.digest, len(name_b)) + name_b
 
-    pixels = math.ceil((len(head) + stored) / BPP)
+    used = len(head) + stored
+    if ecc:  # whole blocks of (255 - ecc) data bytes, and at least ECC_MIN_BLOCKS of them
+        data_bytes = ECC_BLOCK - ecc
+        pixels = math.ceil(max(ECC_MIN_BLOCKS, -(-used // data_bytes)) * ECC_BLOCK / BPP)
+    else:
+        pixels = math.ceil(used / BPP)
     width = math.ceil(math.sqrt(pixels))
     height = math.ceil(pixels / width)
-    buf = bytearray(width * height * BPP)  # zero-filled, so the padding needs no extra pass
+    blocks = width * height * BPP // ECC_BLOCK
+    # zero-filled, so the padding needs no extra pass
+    buf = bytearray(blocks * (ECC_BLOCK - ecc) if ecc else width * height * BPP)
     buf[:len(head)] = head
-    view, pos, end = memoryview(buf), len(head), len(head) + stored
+    view, pos, end = memoryview(buf), len(head), used
     payload.seek(0)
     while pos < end:
         n = payload.readinto(view[pos:end])
@@ -209,6 +241,9 @@ def encode(src: BinaryIO, name: str, compress: bool = True, kind: int = 0,
     for spool in (packed, xz, squeezed):
         if spool:
             spool.close()
+    if ecc:
+        buf = _ecc_encode(buf, used, blocks, ecc, width * height * BPP, task)
+        meta.ecc = EccReport(ecc, blocks)
     # RGBA maps the buffer in place instead of copying it
     return Image.frombuffer("RGBA", (width, height), buf, "raw", "RGBA", 0, 1), meta
 
@@ -350,25 +385,260 @@ def _verified(meta: Meta, chunks: Iterator[bytes]) -> Iterator[bytes]:
                              "sha")
 
 
-def decode(img: Image.Image) -> tuple[Meta, Iterator[bytes]]:
+# ------------------------------------------------------------------ error correction
+#
+# Reed-Solomon over GF(256), 255-byte blocks (255 - parity data bytes, then parity). The blocks
+# are interleaved across the whole image (byte j of block i sits at j * blocks + i), so a stripe,
+# a painted-over area or a cut-off corner costs each block only a few bytes. The data is stored
+# unchanged next to its parity; the parity level is found again from the pixels (ECC_STEP).
+
+ECC_BLOCK = 255
+ECC_STEP = 8  # parity comes in multiples of this: fewer than 8 and a wrong guess "decodes" anything
+ECC_MAX_PARITY = 128
+ECC_MIN_BLOCKS = 4
+
+_EXP = [0] * 512
+_LOG = [0] * 256
+_x = 1
+for _i in range(255):
+    _EXP[_i], _LOG[_x] = _x, _i
+    _x <<= 1
+    if _x & 0x100:
+        _x ^= 0x11D
+for _i in range(255, 512):
+    _EXP[_i] = _EXP[_i - 255]
+del _x, _i
+
+
+def _gmul(a: int, b: int) -> int:
+    return _EXP[_LOG[a] + _LOG[b]] if a and b else 0
+
+
+def ecc_parity_bytes(percent: float) -> int:
+    """Parity bytes per block for an overhead of *percent* of the image (0 = no error correction)."""
+    if percent <= 0:
+        return 0
+    return min(ECC_MAX_PARITY, max(ECC_STEP, ECC_STEP * round(ECC_BLOCK * percent / 100 / ECC_STEP)))
+
+
+class _RS:
+    """Systematic Reed-Solomon coder for one parity size (roots alpha^0 .. alpha^(parity-1))."""
+
+    def __init__(self, parity: int):
+        self.parity = parity
+        gen = [1]
+        for i in range(parity):  # gen *= (x + alpha^i)
+            nxt = gen + [0]
+            for j, c in enumerate(gen):
+                nxt[j + 1] ^= _gmul(c, _EXP[i])
+            gen = nxt
+        # feedback[f] is f * gen (without the leading 1), packed into one integer
+        self.feedback = [int.from_bytes(bytes(_gmul(f, g) for g in gen[1:]), "big") for f in range(256)]
+        self.mask = (1 << 8 * parity) - 1
+        self.shift = 8 * (parity - 1)
+        self.times_alpha = [[_gmul(_EXP[j], v) for v in range(256)] for j in range(parity)]
+
+    def parity_of(self, data) -> int:
+        """Remainder of data(x) * x^parity modulo the generator, as one big-endian integer."""
+        reg, feedback, mask, shift = 0, self.feedback, self.mask, self.shift
+        for d in data:
+            reg = ((reg << 8) & mask) ^ feedback[d ^ (reg >> shift)]
+        return reg
+
+    def _syndromes(self, remainder: int) -> list[int]:
+        rem = remainder.to_bytes(self.parity, "big")
+        out = []
+        for table in self.times_alpha:
+            acc = 0
+            for b in rem:
+                acc = table[acc] ^ b
+            out.append(acc)
+        return out
+
+    def repair(self, block: bytearray) -> bool:
+        """Fix a 255-byte block in place. False if it has more errors than the code can correct."""
+        k = ECC_BLOCK - self.parity
+        remainder = self.parity_of(block[:k]) ^ int.from_bytes(block[k:], "big")
+        if not remainder:
+            return True
+        syn = self._syndromes(remainder)
+        # Berlekamp-Massey: the error locator polynomial, lowest degree first
+        loc, prev, length, gap, prev_d = [1], [1], 0, 1, 1
+        for n in range(self.parity):
+            d = syn[n]
+            for i in range(1, length + 1):
+                d ^= _gmul(loc[i], syn[n - i]) if i < len(loc) else 0
+            if not d:
+                gap += 1
+                continue
+            scaled = [_gmul(c, _EXP[_LOG[d] - _LOG[prev_d] + 255]) for c in prev]
+            new = loc + [0] * max(0, gap + len(scaled) - len(loc))
+            for i, c in enumerate(scaled):
+                new[i + gap] ^= c
+            if 2 * length <= n:
+                prev, prev_d, length, gap = loc, d, n + 1 - length, 1
+            else:
+                gap += 1
+            loc = new
+        if length > self.parity // 2:
+            return False
+        loc = loc[:length + 1]
+        if len(loc) <= length:
+            loc += [0] * (length + 1 - len(loc))
+        # Chien search: block position m has locator alpha^(254 - m)
+        roots = []
+        for e in range(ECC_BLOCK):
+            x = (ECC_BLOCK - e) % ECC_BLOCK
+            v = 0
+            for i, c in enumerate(loc):
+                if c:
+                    v ^= _EXP[(_LOG[c] + i * x) % 255]
+            if not v:
+                roots.append(e)
+        if len(roots) != length:
+            return False
+        # Forney: error values from the evaluator polynomial
+        omega = [0] * self.parity
+        for i in range(self.parity):
+            for j in range(min(i, length) + 1):
+                omega[i] ^= _gmul(loc[j], syn[i - j])
+        fixed = bytearray(block)
+        for e in roots:
+            x = (ECC_BLOCK - e) % ECC_BLOCK
+            num = den = 0
+            for i, c in enumerate(omega):
+                if c:
+                    num ^= _EXP[(_LOG[c] + i * x) % 255]
+            for i in range(1, length + 1, 2):
+                if loc[i]:
+                    den ^= _EXP[(_LOG[loc[i]] + (i - 1) * x) % 255]
+            if not den:
+                return False
+            if num:
+                fixed[ECC_BLOCK - 1 - e] ^= _EXP[(_LOG[num] - _LOG[den] + e) % 255]
+        if self.parity_of(fixed[:k]) != int.from_bytes(fixed[k:], "big"):
+            return False  # "corrected" into a different, wrong word: more damage than the code can repair
+        block[:] = fixed
+        return True
+
+
+@functools.lru_cache(maxsize=4)
+def _rs(parity: int) -> _RS:
+    return _RS(parity)
+
+
+
+def _ecc_encode(data: bytearray, used: int, blocks: int, parity: int, size: int, task: Task | None) -> bytearray:
+    """Lay *data* (blocks * (255 - parity) bytes, the last of it padding) out as interleaved codewords."""
+    rs, k = _rs(parity), ECC_BLOCK - parity
+    par = bytearray(blocks * parity)  # blocks past the data are all zero and so have zero parity
+    view = memoryview(data)
+    full = -(-used // k)
+    if task:
+        task.phase("Adding error correction", full)
+    for i in range(full):
+        par[i * parity:(i + 1) * parity] = rs.parity_of(view[i * k:(i + 1) * k]).to_bytes(parity, "big")
+        if task and i % 256 == 255:
+            task.advance(256)
+    out = bytearray(size)
+    for j in range(k):
+        out[j * blocks:(j + 1) * blocks] = data[j::k]
+    for j in range(parity):
+        out[(k + j) * blocks:(k + j + 1) * blocks] = par[j::parity]
+    return out
+
+
+def _ecc_detect(buf: bytearray, blocks: int) -> int | None:
+    """The parity size this image was made with, found by trying each on a few blocks.
+    A block repairs under the right size and (almost never) under a wrong one, so this works
+    even when every block is damaged."""
+    picks = [b for b in (bytearray(buf[i:i + ECC_BLOCK * blocks:blocks])
+                         for i in sorted({t * blocks // 8 for t in range(8)})) if any(b)]
+    best, best_score = None, 0
+    for parity in range(ECC_STEP, ECC_MAX_PARITY + 1, ECC_STEP):
+        rs = _rs(parity)
+        score = sum(rs.repair(bytearray(b)) for b in picks)
+        if score >= best_score and score * 3 >= len(picks) * 2:
+            best, best_score = parity, score
+    return best
+
+
+def _ecc_open(img: Image.Image, task: Task | None) -> tuple[bytearray, EccReport] | None:
+    """Repair an error-corrected image and return the data it carries, or None if it isn't one."""
+    if cached := getattr(img, "_imagestore_ecc", None):  # inspect decodes an image more than once
+        return cached
+    buf = bytearray(img.tobytes())
+    blocks = len(buf) // ECC_BLOCK
+    if blocks < ECC_MIN_BLOCKS or (parity := _ecc_detect(buf, blocks)) is None:
+        return None
+    rs, k = _rs(parity), ECC_BLOCK - parity
+    report = EccReport(parity, blocks)
+    if task:
+        task.phase("Checking error correction", blocks)
+    for i in range(blocks):
+        block = bytearray(buf[i:ECC_BLOCK * blocks:blocks])
+        if any(block):  # all-zero blocks are padding
+            before = bytes(block)
+            if not rs.repair(block):
+                report.failed_blocks += 1
+            elif before != block:
+                report.repaired_blocks += 1
+                for m in range(ECC_BLOCK):
+                    if before[m] != block[m]:
+                        buf[m * blocks + i] = block[m]
+                        report.repaired_bytes += 1
+        if task and i % 256 == 255:
+            task.advance(256)
+    data = bytearray(blocks * k)
+    for j in range(k):
+        data[j::k] = buf[j * blocks:(j + 1) * blocks]
+    img._imagestore_ecc = data, report
+    return data, report
+
+
+
+class _BufferPixels:
+    """_Pixels over bytes already in memory (the data carried by an error-corrected image)."""
+
+    def __init__(self, data: bytearray):
+        self.data, self.total, self.pos = memoryview(data), len(data), 0
+
+    def read(self, n: int) -> memoryview:
+        chunk = self.data[self.pos:self.pos + n]
+        self.pos += len(chunk)
+        return chunk
+
+
+def decode(img: Image.Image, task: Task | None = None) -> tuple[Meta, Iterator[bytes]]:
     """Parse the header and return (meta, original bytes in chunks).
 
     The size and SHA-256 checks run when the iterator is exhausted and raise ImageStoreError, so
     consume it fully before trusting the data (write to scratch space, then commit).
+    task only reports progress while an error-corrected image is being checked.
     """
     px = _Pixels(img)
     head = px.read(HEADER.size)
     if len(head) < HEADER.size:
         raise ImageStoreError("image too small to contain an ImageStore header", "too_small")
+    ecc = None
+    if head[:4] != MAGIC or head[5] & FLAG_ECC:
+        # error-corrected pixels hold interleaved codewords, so the header is not at the start
+        if opened := _ecc_open(img, task):
+            px, ecc = _BufferPixels(opened[0]), opened[1]
+            head = px.read(HEADER.size)
+        elif head[:4] == MAGIC:
+            raise ImageStoreError("the header says this image has error correction, but none could be found", "ecc")
     magic, version, flags, orig, stored, digest, name_len = HEADER.unpack(head)
     if magic != MAGIC:
+        if ecc and ecc.failed_blocks:
+            raise ImageStoreError(_ecc_failure(ecc), "ecc")
         raise ImageStoreError("not an ImageStore image (bad magic)", "magic")
     if version != VERSION:
         raise ImageStoreError(f"unsupported ImageStore version {version}", "version")
     if HEADER.size + name_len + stored > px.total:
         raise ImageStoreError("image is truncated (payload extends past the pixel data)", "truncated")
     name = bytes(px.read(name_len)).decode("utf-8", errors="replace")
-    meta = Meta(name, flags, orig, stored, digest)
+    meta = Meta(name, flags, orig, stored, digest, ecc)
     if bin(flags & (FLAG_ZLIB | FLAG_LZMA | FLAG_SQUEEZE)).count("1") > 1:
         raise ImageStoreError("header marks the payload as stored more than one way", "version")
     chunks = _payload(px, stored)
@@ -378,7 +648,24 @@ def decode(img: Image.Image) -> tuple[Meta, Iterator[bytes]]:
         chunks = _unlzma(chunks, orig)
     elif meta.squeezed:
         chunks = _unsqueeze(chunks, orig)
-    return meta, _verified(meta, chunks)
+    chunks = _verified(meta, chunks)
+    return meta, _blame_ecc(meta, chunks) if ecc and ecc.failed_blocks else chunks
+
+
+def _ecc_failure(report: EccReport) -> str:
+    return (f"damage beyond what error correction can repair: {report.failed_blocks:,} of {report.blocks:,} "
+            f"blocks are too damaged ({report.parity} parity bytes per block repair up to "
+            f"{report.parity // 2} damaged bytes each)")
+
+
+def _blame_ecc(meta: Meta, chunks: Iterator[bytes]) -> Iterator[bytes]:
+    """When blocks could not be repaired, say so instead of a bare checksum failure."""
+    try:
+        yield from chunks
+    except ImageStoreError as e:
+        if e.kind in ("sha", "size", "zlib", "squeeze"):
+            raise ImageStoreError(f"{_ecc_failure(meta.ecc)} ({e})", "ecc") from e
+        raise
 
 
 def is_ignored(name: str) -> bool:
@@ -695,7 +982,8 @@ class EncodeResult:
 
     @property
     def padding(self) -> int:
-        return self.capacity - self.header_size - self.meta.stored_size
+        parity = self.meta.ecc.blocks * self.meta.ecc.parity if self.meta.ecc else 0
+        return self.capacity - self.header_size - self.meta.stored_size - parity
 
     @property
     def saved_fraction(self) -> float:
@@ -749,7 +1037,7 @@ def _check_output(out: Path, force: bool) -> None:
 def _verify_png(path: Path, meta: Meta, task: Task) -> None:
     """Decode a freshly written PNG and check its header and SHA-256 against what was encoded."""
     task.phase("Verifying written PNG")
-    got, chunks = decode(open_image(path))
+    got, chunks = decode(open_image(path), task)
     if (got.name, got.flags, got.orig_size, got.stored_size, got.digest) != (
             meta.name, meta.flags, meta.orig_size, meta.stored_size, meta.digest):
         raise ImageStoreError("the written PNG's header does not match what was encoded", "verify")
@@ -758,7 +1046,7 @@ def _verify_png(path: Path, meta: Meta, task: Task) -> None:
 
 
 def encode_stream(data: BinaryIO, name: str, out: Path, *, compress: bool = True, force: bool = False,
-                  window: int = LZMA_WINDOW,
+                  window: int = LZMA_WINDOW, ecc: float = 0,
                   kind: int = 0, source: str = "", task: Task | None = None, verify: bool = True,
                   files: int = 0, skipped: int = 0, pack: PackStats | None = None) -> EncodeResult:
     """Encode a seekable stream to *out*: written to a temporary sibling, verified by decoding
@@ -768,7 +1056,8 @@ def encode_stream(data: BinaryIO, name: str, out: Path, *, compress: bool = True
     _check_output(out, force)
     total = data.seek(0, os.SEEK_END)
     data.seek(0)
-    img, meta = encode(_TrackedReader(data, task, total, compress), name, compress, kind, window)
+    img, meta = encode(_TrackedReader(data, task, total, compress), name, compress, kind, window,
+                       ecc_parity_bytes(ecc), task)
     width, height = img.size
     task.phase("Writing PNG")
     tmp = out.with_name(f".{out.name}.imagestore-{os.getpid()}.part")
@@ -798,7 +1087,7 @@ def portable_name(name: str) -> str:
 
 
 def encode_path(src: Path, out: Path | None = None, *, compress: bool = True, force: bool = False,
-                window: int = LZMA_WINDOW,
+                window: int = LZMA_WINDOW, ecc: float = 0,
                 ignore: bool = False, exclude: Collection[str] | None = None, task: Task | None = None,
                 verify: bool = True) -> EncodeResult:
     task = task or Task()
@@ -813,25 +1102,25 @@ def encode_path(src: Path, out: Path | None = None, *, compress: bool = True, fo
         pack = PackStats()
         tar, files = pack_dir(src, ignore, exclude=exclude, on_entry=lambda _ti: task.advance(1), stats=pack)
         with tar:
-            return encode_stream(tar, portable_name(src.name) or "folder", out, compress=compress, force=force, window=window, kind=FLAG_DIR,
+            return encode_stream(tar, portable_name(src.name) or "folder", out, compress=compress, force=force, window=window, ecc=ecc, kind=FLAG_DIR,
                                  source=f"folder {src}", task=task, verify=verify, files=files, skipped=skipped, pack=pack)
     if src.is_file():
         out = Path(out) if out else default_png_path(src)
         _check_output(out, force)
         with src.open("rb") as f:
-            return encode_stream(f, portable_name(src.name), out, compress=compress, force=force, window=window, source=str(src), task=task,
+            return encode_stream(f, portable_name(src.name), out, compress=compress, force=force, window=window, ecc=ecc, source=str(src), task=task,
                                  verify=verify)
     raise ImageStoreError(f"no such file or folder: {src}", "missing")
 
 
 def encode_text(text: str, out: Path | None = None, *, compress: bool = True, force: bool = False,
-                window: int = LZMA_WINDOW,
+                window: int = LZMA_WINDOW, ecc: float = 0,
                 task: Task | None = None, verify: bool = True) -> EncodeResult:
     try:
         data = text.encode("utf-8")
     except UnicodeEncodeError as e:
         raise ImageStoreError(f"the text cannot be encoded as UTF-8: {e}", "text") from e
-    return encode_stream(io.BytesIO(data), TEXT_NAME, Path(out or "text.png"), compress=compress, window=window,
+    return encode_stream(io.BytesIO(data), TEXT_NAME, Path(out or "text.png"), compress=compress, window=window, ecc=ecc,
                          force=force, kind=FLAG_TEXT, source=f"text ({len(text):,} chars)", task=task, verify=verify)
 
 
@@ -850,7 +1139,7 @@ def decode_path(src: Path, out_dir: Path | None = None, *, force: bool = False, 
     src = Path(src)
     task.phase("Reading image")
     img = open_image(src)
-    meta, chunks = decode(img)
+    meta, chunks = decode(img, task)
     width, height = img.size
     chunks = task.track(chunks, "Decoding and verifying", meta.orig_size)
     if meta.is_text and text_in_memory:
@@ -915,7 +1204,7 @@ def inspect_path(src: Path, task: Task | None = None) -> InspectResult:
     width, height = img.size
     base = dict(src=src, width=width, height=height, mode=img.mode, png_size=src.stat().st_size)
     try:
-        meta, chunks = decode(img)
+        meta, chunks = decode(img, task)
     except Cancelled:
         raise
     except ImageStoreError as e:
@@ -934,7 +1223,7 @@ def inspect_path(src: Path, task: Task | None = None) -> InspectResult:
         # (the check itself already hashed it once; a passing check needs no second pass).
         sha = hashlib.sha256()
         try:
-            for chunk in task.track(decode(img)[1], "Computing SHA-256 of the altered payload", meta.orig_size):
+            for chunk in task.track(decode(img, task)[1], "Computing SHA-256 of the altered payload", meta.orig_size):
                 sha.update(chunk)
         except Cancelled:
             raise
@@ -957,7 +1246,8 @@ class Explanation:
 _EXPLAIN = {
     "magic": ("Not an ImageStore image",
               "This PNG does not start with an ImageStore header. It was made by something else, or its "
-              "pixels were changed so much that the header is gone."),
+              "pixels were changed so much that the header is gone (for an image with error correction, "
+              "so much that it can no longer be recognised)."),
     "mode": ("Unsupported PNG colour mode",
              "ImageStore archives are RGBA PNGs, and every channel (alpha too) carries data. Some app "
              "converted this one, which usually means the alpha channel was stripped. Use the original file."),
@@ -974,6 +1264,10 @@ _EXPLAIN = {
              "The zlib or LZMA stream inside the image could not be decompressed. Pixel values changed after "
              "encoding (lossy re-compression, colour management or alpha premultiplication). Nothing is "
              "written when this check fails."),
+    "ecc": ("Too damaged for error correction",
+            "This image has error correction, but more of it is damaged than the parity can repair, "
+            "or its error-correction data is missing. Nothing is written when this check fails; try "
+            "an earlier or untouched copy of the PNG."),
     "memory": ("Not enough memory to compress",
                "The LZMA window asked for needs more RAM than is available. Choose a smaller window "
                "(--window in the CLI) or turn compression off. Nothing was written."),
@@ -1137,6 +1431,32 @@ def _payload_line(r: EncodeResult) -> str:
     return f"{human(m.stored_size)}  [dim]raw · compression off[/]"
 
 
+def ecc_summary(e: EccReport, decoding: bool = True) -> tuple[str, str]:
+    """Plain-text line about error correction and its tone ("success", "warning", "danger" or "")."""
+    strength = f"{e.overhead:.1%} parity, repairs up to ~{e.tolerance:.1%} damage"
+    if not decoding:
+        return strength, ""
+    if e.failed_blocks:
+        return f"{e.failed_blocks:,} of {e.blocks:,} blocks beyond repair · {strength}", "danger"
+    if e.repaired_bytes:
+        return (f"Repaired {e.repaired_bytes:,} damaged bytes in {e.repaired_blocks:,} of {e.blocks:,} blocks · "
+                f"{strength}"), "warning"
+    return f"Undamaged · {strength}", "success"
+
+
+def ecc_text(e: EccReport, decoding: bool = True) -> str:
+    """One line about error correction, as rich markup."""
+    strength = f"{e.overhead:.1%} parity [dim]· repairs up to ~{e.tolerance:.1%} damage[/]"
+    if not decoding:
+        return strength
+    if e.failed_blocks:
+        return f"[red]✗ {e.failed_blocks:,} of {e.blocks:,} blocks beyond repair[/]  [dim]{strength}[/]"
+    if e.repaired_bytes:
+        return (f"[yellow]repaired {e.repaired_bytes:,} damaged bytes[/] [dim]in {e.repaired_blocks:,} of "
+                f"{e.blocks:,} blocks[/]  [dim]{strength}[/]")
+    return f"[green]✓ undamaged[/]  [dim]{strength}[/]"
+
+
 def render_encode(r: EncodeResult) -> None:
     m = r.meta
     if r.meta.is_dir:
@@ -1151,6 +1471,7 @@ def render_encode(r: EncodeResult) -> None:
         ("Output", escape(show_path(r.out))),
         ("Original", human(m.orig_size)),
         ("Stored", _payload_line(r)),
+        *([("Error correction", ecc_text(m.ecc, decoding=False))] if m.ecc else []),
         *([("Duplicates", f"{r.duplicates:,} identical {'file' if r.duplicates == 1 else 'files'} stored once  "
                           f"[dim]· {human(r.duplicate_bytes)} not stored[/]")] if r.duplicates else []),
         ("PNG file", f"{human(r.png_size)} on disk"),
@@ -1177,6 +1498,7 @@ def render_decode(r: DecodeResult) -> None:
     report("[green]✓[/] Decoded", [
         ("Image", escape(show_path(r.src))),
         ("Restored", f"{escape(show_path(r.out))}{'/' if m.is_dir else ''}  [dim]({detail})[/]"),
+        *([("Error correction", ecc_text(m.ecc))] if m.ecc else []),
         ("Integrity", "[green]✓ SHA-256 verified[/] [dim]before anything was written[/]"),
     ])
 
@@ -1208,8 +1530,9 @@ def render_inspect(r: InspectResult) -> None:
          + "[/]"),
         ("Capacity", f"{human(r.capacity)} across {r.width * r.height:,} pixels  "
                      f"[dim]({used / r.capacity:.1%} used)[/]" if r.capacity else "0 B"),
+        *([("Error correction", ecc_text(m.ecc))] if m.ecc else []),
         ("Format", f"[dim]v{VERSION} · flags 0x{m.flags:02x}"
-                   f"{' (' + ', '.join(n for f, n in ((FLAG_ZLIB, 'zlib'), (FLAG_LZMA, 'lzma'), (FLAG_TEXT, 'text'), (FLAG_DIR, 'folder'), (FLAG_SQUEEZE, 'squeezed')) if m.flags & f) + ')' if m.flags else ''}[/]"),
+                   f"{' (' + ', '.join(n for f, n in ((FLAG_ZLIB, 'zlib'), (FLAG_LZMA, 'lzma'), (FLAG_TEXT, 'text'), (FLAG_DIR, 'folder'), (FLAG_SQUEEZE, 'squeezed'), (FLAG_ECC, 'ecc')) if m.flags & f) + ')' if m.flags else ''}[/]"),
         ("SHA-256", f"[dim]{m.digest.hex()}[/]  [dim](stored)[/]"),
     ]
     if r.ok:
@@ -1272,22 +1595,22 @@ def ask_ignore(src: Path) -> tuple[bool, set[str] | None]:
 
 
 def do_encode(src: Path, out: Path | None, compress: bool, force: bool,
-              ignore: bool | None = None, verify: bool = True, window: int = LZMA_WINDOW) -> EncodeResult:
+              ignore: bool | None = None, verify: bool = True, window: int = LZMA_WINDOW, ecc: float = 0) -> EncodeResult:
     """ignore: True/False decides auto-ignore for folders; None asks."""
     exclude = None
     if ignore is None:
         ignore, exclude = ask_ignore(Path(src).resolve()) if Path(src).is_dir() else (False, None)
     with _CliProgress() as task:
         result = encode_path(src, out, compress=compress, force=force, ignore=ignore, exclude=exclude, task=task,
-                             verify=verify, window=window)
+                             verify=verify, window=window, ecc=ecc)
     render_encode(result)
     return result
 
 
 def do_encode_text(text: str, out: Path | None, compress: bool, force: bool, verify: bool = True,
-                   window: int = LZMA_WINDOW) -> EncodeResult:
+                   window: int = LZMA_WINDOW, ecc: float = 0) -> EncodeResult:
     with _CliProgress() as task:
-        result = encode_text(text, out, compress=compress, force=force, window=window, task=task, verify=verify)
+        result = encode_text(text, out, compress=compress, force=force, window=window, ecc=ecc, task=task, verify=verify)
     render_encode(result)
     return result
 
@@ -1533,6 +1856,16 @@ def _window_mib(text: str) -> int:
     return mib << 20
 
 
+def _ecc_percent(text: str) -> float:
+    try:
+        pct = float(text)
+    except ValueError:
+        pct = -1
+    if not 0 <= pct <= 50:
+        raise argparse.ArgumentTypeError("must be a percentage from 0 to 50")
+    return pct
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="imagestore", description=f"Serialize files into RGBA PNG images. {TAGLINE}",
                                  epilog="Run without arguments in a terminal for the interactive menu.")
@@ -1544,6 +1877,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-t", "--text", help="encode this string instead of a file")
     p.add_argument("-o", "--output", type=Path, help="output PNG (default: <file>.png, or text.png)")
     p.add_argument("--no-compress", action="store_true", help="skip zlib/LZMA pre-compression")
+    p.add_argument("--ecc", type=_ecc_percent, default=0, metavar="PERCENT",
+                   help="add error correction using about this much extra space (0-50, default 0 = off): the "
+                        "image can then be repaired after about half that share of it is damaged. Slower to "
+                        "encode and decode")
     p.add_argument("--window", type=_window_mib, default=LZMA_WINDOW, metavar="MiB",
                    help="cap on the LZMA window, 1-1024 MiB (default 64; rounded up to a power of two; "
                         "encoding needs about 7x this in RAM). Larger only helps when repeats are far apart")
@@ -1578,13 +1915,13 @@ def main(argv: list[str] | None = None) -> int:
                 ap.error("encode needs exactly one of FILE or -t TEXT")
             if args.text is not None:
                 do_encode_text(args.text, args.output, not args.no_compress, args.force, not args.no_verify,
-                                 window=args.window)
+                                 window=args.window, ecc=args.ecc)
             else:
                 # ask only when someone is there to answer; scripts get exact, unfiltered folders
                 ignore = True if args.auto_ignore else False if args.no_auto_ignore else (
                     None if sys.stdin.isatty() else False)
                 do_encode(args.file, args.output, not args.no_compress, args.force, ignore, not args.no_verify,
-                          window=args.window)
+                          window=args.window, ecc=args.ecc)
         elif args.cmd == "decode":
             do_decode(args.image, args.output_dir, args.force)
         elif args.cmd == "info":

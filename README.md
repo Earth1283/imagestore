@@ -58,6 +58,7 @@ moved into place. `--no-verify` skips the check.
 | `encode` | `-t, --text TEXT` | Encode a string instead of a file |
 | `encode` | `--no-compress` | Skip zlib/LZMA pre-compression |
 | `encode` | `--window MiB` | Cap on the LZMA window, 1-1024 (default 64, rounded up to a power of two). Encoding needs about 7x this in RAM; a larger window only helps when repeats are far apart. The GUI has the same setting. |
+| `encode` | `--ecc PERCENT` | Add error correction using about this much extra space, 0-50 (default 0, off). The image can then be repaired after damage to about half that share of it. The GUI has the same setting. |
 | `encode` | `-f, --force` | Overwrite an existing output |
 | `encode` | `--no-verify` | Skip decoding the written PNG to confirm it (faster, not recommended) |
 | `encode` | `--auto-ignore` / `--no-auto-ignore` | Folders: skip (or keep) junk such as `.DS_Store`, `node_modules`, `__pycache__`, `.git`, `.venv`. By default it asks when run interactively and includes everything when scripted. |
@@ -83,7 +84,7 @@ padding.
 ```
 >4s   magic          "IMST"
 B     version        2
-B     flags          0x01 zlib, 0x02 text, 0x04 folder (tar), 0x08 zero-run squeezed, 0x10 LZMA
+B     flags          0x01 zlib, 0x02 text, 0x04 folder (tar), 0x08 zero-run squeezed, 0x10 LZMA, 0x20 error correction
 Q     original size
 Q     stored size
 32s   SHA-256 of the original bytes
@@ -105,6 +106,19 @@ small files in nested subfolders is mostly zeros. zlib hides that, but when it i
 not win) those zeros would become empty pixels. Folder payloads are therefore also *squeezed*:
 each run of 8 or more zero bytes is replaced by its length (flag `0x08`), and whichever of
 raw, zlib, LZMA and squeezed is smallest is stored. Images made before this change still decode.
+
+Error correction (`--ecc`) is optional and off by default. It stores Reed-Solomon parity in the
+pixels next to the data, in 255-byte blocks that are interleaved across the whole image, so a
+stripe, a painted-over area or a wiped header costs each block only a few bytes. At 25% extra
+space (64 parity bytes per block) an image still decodes after up to about 12.5% of it is
+damaged, and the report says how many bytes were repaired. Parity is chosen in steps of 8 bytes
+per block (about 3%), and the level is recognised again from the pixels, so no extra header
+field is needed. The SHA-256 is still the final check: a repair that does not reproduce the
+original is refused, never returned. Costs: the image grows by the percentage, encoding adds
+roughly 0.1 s per MB, opening an error-corrected image reads all of it into memory, and
+repairing damage takes a few seconds per MB. It cannot undo lossy re-encoding, which changes
+every pixel slightly, and it does not help if so much is damaged that the image is no longer
+recognised as an ImageStore image.
 
 Folders also deduplicate: a file byte-identical to an earlier one (same size, same SHA-256)
 is stored as a tar hard link to that file, with no data of its own. Decoding restores it as an

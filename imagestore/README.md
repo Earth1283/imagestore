@@ -98,6 +98,7 @@ a hint.
   breaks the SHA-256 check; the error message says so. Use [eXact](../eXact/README.md) to
   edit these images safely.
 - zlib or LZMA compression (whichever is smaller) is applied only when it makes the payload smaller.
+- Error correction (`--ecc`) is off unless asked for; see the main README.
 - The digest detects corruption; it is not encryption.
 
 ## Tests
