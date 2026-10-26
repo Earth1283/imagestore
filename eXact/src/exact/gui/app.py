@@ -20,6 +20,12 @@ def main(argv: list[str] | None = None) -> int:
     app.setApplicationName("eXact")
     app.setOrganizationName("eXact")
     app.setApplicationVersion(__version__)
+    from PyQt6.QtCore import QSettings
+
+    from . import style
+
+    style.apply_theme(app, str(QSettings("eXact", "eXact").value("theme", "dark")))
+    app.setWindowIcon(style.app_icon("logo-exact"))
     window = MainWindow()
     window.show()
     files = [a for a in argv[1:] if not a.startswith("-")]

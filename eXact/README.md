@@ -16,6 +16,12 @@ touched.
 eXact is not primarily a photo editor. Visual correctness is not enough; pixel
 correctness is mandatory.
 
+| Edit workspace | Inspect workspace |
+|---|---|
+| ![Edit workspace](../docs/screenshots/exact-edit.png) | ![Inspect workspace](../docs/screenshots/exact-inspect.png) |
+| **Integrity panel** | **Compare dialog** |
+| ![Integrity panel](../docs/screenshots/exact-integrity.png) | ![Compare dialog](../docs/screenshots/exact-compare.png) |
+
 ---
 
 ## Contents
@@ -63,53 +69,68 @@ You can also drag a PNG onto the window to open it.
 
 ## Using the editor
 
-### Window layout
+### Workspace
 
-| Area | What it shows |
+eXact is canvas-first: the image gets the space, and everything else sits in panels you
+can resize, close, float or rearrange.
+
+| Area | What it holds |
 |---|---|
-| **Canvas** (centre) | Nearest-neighbour view, from 12.5% to 3200%, with an optional pixel grid at 400% and above. |
-| **Pixel Inspector** (right) | The inspected pixel's coordinates, canonical byte offset, raw bytes, and each channel in decimal, hex and binary. You can type exact values (or `RRGGBBAA`) and **Apply to pixel**. |
-| **Integrity** (right) | Dimensions, mode, bytes per pixel, the current / original / last-saved pixel SHA-256, modified pixel and byte counts, changed-pixel percentage, net transform, whether dimensions changed, undo memory, and the last operation's exact changed-pixel count and bounding box. |
-| **Hex Bytes** (bottom) | Hex and ASCII dump of the canonical buffer around the inspected pixel, with that pixel's bytes highlighted. You can jump to any byte offset (`1234` or `0x4D2`) or let it follow the cursor. Payload headers such as `IMGSTORE` show up in the ASCII column. |
-| **Image Info** (bottom tab) | The source file's IHDR, interlacing, a list of every chunk, tEXt entries, and load warnings (ICC/gAMA present but not applied, APNG, CRC errors, and so on). |
+| **Toolbar** (top) | Open, Save, Undo/Redo (tooltips name the step), zoom out / level / in, fit, 100%, pixel grid, highlight changes, display mode, Current / Original / Split view with the split slider, Compare, and the **Edit / Inspect** workspace switch. |
+| **Tool palette** (left) | Inspect, Pencil, Eyedropper, Rectangle Select, Hand and Zoom tools; rotate and flip; a chip showing the pencil colour. |
+| **Canvas** (centre) | Nearest-neighbour view from 12.5% to 3200%, optional pixel grid at 400% and above, empty state with drag-and-drop. |
+| **Tool** (right) | Properties of the active tool. Pencil: exact RGBA values (swatch, `RRGGBBAA`, a slider and number per channel) each with its own **write** toggle, and size. Select: the selection as editable x, y, w, h, plus copy, paste, fill and select-all. |
+| **Pixel** (right) | The inspected pixel: coordinates, canonical byte offset, raw bytes, and each channel in decimal, hex and binary **next to its original value**. Edit any channel and press **Apply** (or Enter); **Restore original** writes the original values back; **Use as colour** copies them to the pencil. A line says whether the pixel matches the original, or exactly what changed. |
+| **History** (right) | Every undoable step. Click an entry to undo or redo up to it; the saved state is marked; memory use against the 1 GiB budget. |
+| **Hex** (bottom) | The whole canonical buffer, four pixels per row, bytes tinted by channel. Click a byte, or use the arrows, Page Up/Down, Home/End and Tab (next pixel); type an offset (`1234`, `0x4D2`) or `x, y` to jump. Follows the inspected pixel, or the mouse with *Follow hover*. |
+| **Integrity** (bottom) | Whether the buffer matches the **original** and the **saved file**, every pixel hash and counter, and buttons to recompute hashes, copy a report or compare. |
+| **Image Info** (bottom) | IHDR, interlacing, every chunk, tEXt entries and load notes (ICC/gAMA present but not applied, APNG, CRC errors, ...). |
+| **Status bar** | Pixel under the cursor (coordinates and channel values), size and mode, zoom, and two always-visible chips: integrity versus the original, and versus the saved file. |
 
-The toolbar also has a **display mode** selector, a **before/after** selector, and a split
-slider:
+**Workspaces.** *Edit* (Ctrl+1) shows Tool, Pixel and History; *Inspect* (Ctrl+2) shows
+Pixel, Hex, Integrity and Image Info and switches to the Inspect tool. Each workspace
+remembers how you rearranged it; View > Reset Workspace Layout restores the default.
+View > Theme switches between dark (default) and light.
 
-- **Display modes:** composite over checkerboard, RGB ignoring alpha (reveals data hidden
-  in transparent pixels), alpha as greyscale, and the single R, G or B channel.
-- **Before/after:** Current, Original, or Split (original on the left, current on the
-  right).
+**Integrity at a glance.** The status-bar chips update instantly after every operation from
+exact incremental counters (no rescanning). A SHA-256 of the whole buffer then confirms the
+state off the GUI thread, half a second after the last edit, never per brush movement.
+"Matches saved file" is reported either because no edit happened since the save, or because
+the hash shows the edits cancel out.
 
-**View → Highlight Changed Pixels** tints every pixel whose value differs from the
-original. All of these are display-only.
+The **display mode** selector (composite over checkerboard, RGB ignoring alpha, alpha as
+greyscale, single R/G/B channel), **Current / Original / Split** and **Highlight changed
+pixels** are display-only: they never touch the buffer, which a test checks.
 
 ### Tools and shortcuts
 
-On macOS, *Ctrl* below means *⌘*.
+On macOS, *Ctrl* below means *⌘*. Help > Keyboard Shortcuts (F1) lists them in the app.
 
 | Action | Shortcut |
 |---|---|
-| Inspect / Pencil / Rectangle select / Hand tool | `I` / `P` / `M` / `H` |
+| Inspect / Pencil / Eyedropper / Rectangle select / Hand / Zoom tool | `I` / `P` / `E` / `M` / `H` / `Z` |
+| Smaller / larger pencil | `[` / `]` |
+| Edit / Inspect workspace | Ctrl + `1` / Ctrl + `2` |
 | Pan | Space + drag, middle-drag, Hand tool, or scroll |
-| Zoom in / out / 100% / fit | Ctrl + `=` / Ctrl + `-` / Ctrl + `0` / Ctrl + `9`, or Ctrl + scroll |
+| Zoom in / out / 100% / fit | Ctrl + `=` / Ctrl + `-` / Ctrl + `0` / Ctrl + `9`, Ctrl + scroll, or the Zoom tool (Alt+click zooms out) |
 | Pixel grid | Ctrl + `'` |
 | Show original (before) | `\` |
 | Highlight changed pixels | Ctrl + Shift + `H` |
-| Pick pencil colour from image | Alt + click (Pencil tool) |
+| Pick pencil colour from image | Eyedropper tool, or Alt + click with the Pencil |
 | Go to pixel… | Ctrl + `G` |
 | Copy selection / Paste (click to place) / Paste at coordinates | Ctrl + `C` / Ctrl + `V` / Ctrl + Shift + `V` |
 | Cancel paste placement | `Esc` or right-click |
 | Fill selection with pencil colour | Ctrl + Backspace |
 | Select all / Deselect | Ctrl + `A` / Ctrl + `D` |
-| Rotate 90° CW / CCW | Ctrl + `R` / Ctrl + Shift + `R` (180° and flips are in the **Image** menu) |
+| Rotate 90° CW / CCW | Ctrl + `R` / Ctrl + Shift + `R` (180° and flips are in the **Image** menu and the tool palette) |
 | Undo / Redo | Ctrl + `Z` / Ctrl + Shift + `Z` |
 | Compare two PNGs | Ctrl + Shift + `D` |
 
-**Pencil.** Set the colour in the tool bar with exact `RRGGBBAA` hex values, the colour
-dialog, Alt+click, or *Use as pencil colour* in the inspector. Sizes range from 1 to 64
-pixels (square, no anti-aliasing). The **Write: R G B A** checkboxes are a channel write
-mask: unchecked channels are never modified. For example, you can rewrite only the alpha
+**Pencil.** Set the colour in the Tool panel with exact `RRGGBBAA` hex values, the per-channel
+sliders and numbers, the colour dialog, the Eyedropper, Alt+click, or *Use as colour* in the
+Pixel panel. Sizes range from 1 to 64
+pixels (square, no anti-aliasing). The **Write** toggle beside each channel is a write
+mask: unticked channels are never modified. For example, you can rewrite only the alpha
 channel of a region.
 
 **Paste** writes raw channel values. If the clipboard and the image have different
@@ -126,8 +147,10 @@ pixel-order payloads will not decode until you apply the inverse.
 
 ### Pixel-difference viewer
 
-**File → Compare PNG Pixel Buffers…** compares two PNG files, or the current unsaved
-buffer against a file. The two images must have equal dimensions and mode. The report
+**File → Compare Pixel Buffers…** compares two PNG files, or the current unsaved
+buffer against a file (drop files on the dialog to fill A and B). **File → Compare with File
+on Disk** compares the buffer with the file it was opened from or last saved to. The dialog
+leads with a verdict and the three levels of sameness, with the full text report below. The two images must have equal dimensions and mode. The report
 shows:
 
 - whether the PNG files are byte-identical, whether the decoded pixel buffers are
@@ -305,8 +328,8 @@ alpha=0 pixels with non-zero RGB, and so on.
 ## Tests
 
 ```bash
-python -m pytest            # 68 tests, about 20 s
-python -m pytest --runslow  # adds 7488×7487 full-size tests (70 total)
+python -m pytest            # 87 tests, about 30 s (GUI tests run headless with QT_QPA_PLATFORM=offscreen)
+python -m pytest --runslow  # adds 7488×7487 full-size tests (90 total)
 ```
 
 The tests cover:
@@ -336,6 +359,15 @@ The tests cover:
   transforms run through the window, saved output is checked, the inspector and hex
   panel are exercised, and screen pixels are checked after edit, undo and transform to
   confirm tile invalidation
+- the redesigned workspace (`tests/test_gui_workspace.py`): every view mode, zoom,
+  workspace and theme leaves the buffer byte-identical and a no-op save is exact (RGB under
+  alpha 0 included); single-channel edits and *Restore original* through the Pixel panel;
+  the Tool panel's write mask (alpha-only pencil leaves RGB untouched); Eyedropper and Zoom
+  tools never write; History jumps; transform round trips; hex keyboard, mouse and go-to
+  navigation; workspace presets and their memory; off-thread SHA-256 confirmation and no
+  hashing during a brush stroke; tile eviction never losing unsaved edits; compare dialog;
+  error explanations; cancellable open (state unchanged) while save and transforms are never
+  cancellable; a 3000×2000 navigation test and a 7488×7487 one under `--runslow`
 - the **final acceptance test**
 
 **Final acceptance test** (`tests/test_acceptance.py`):
@@ -353,14 +385,15 @@ The suite passes on Python 3.14.2 and 3.11.
 
 ## Performance (measured)
 
+### Original measurements (macOS)
+
 Measured with `python scripts/benchmark.py`, using a 7488×7487 RGBA PNG of random bytes
 (224 MB raw, 224 MB as PNG, since random data does not compress). Each scenario runs in a
 fresh process, and peak RSS is `ru_maxrss` for that process.
 
 **Machine:** MacBook with Intel Core i5-1030NG7 (1.1 GHz, 4 cores), 16 GB RAM, macOS
 15.8.2, Python 3.14.2, PyQt6 6.10.1, Pillow 12.1.0, NumPy 2.4.2. This CPU throttles
-heavily, so times are given as the range over three uncontended runs. A fourth run that
-overlapped a `pip install` was discarded.
+heavily, so times are given as the range over three uncontended runs.
 
 | Scenario | Peak RSS | Time |
 |---|---|---|
@@ -373,9 +406,60 @@ overlapped a `pip install` was discarded.
 | GUI: open + paint a 1600×1000 window | 581 MB | – |
 | Paint: cold tiles / cached / after a 64 px scroll | – | 63–110 ms / 3–15 ms / 2–36 ms |
 
+### Before and after the workspace redesign (Linux)
+
+Same benchmark, run twice before the redesign and twice after, on a shared 4-vCPU cloud VM
+(Intel Xeon @ 2.8 GHz, 16 GB, Linux 6.18, Python 3.13.17, PyQt6 6.11.0, Pillow 13.0.0,
+NumPy 2.5.4, Qt offscreen platform). The VM is noisy: ranges are min–max of the two runs.
+
+| Scenario | Peak RSS before → after | Time before | Time after |
+|---|---|---|---|
+| Open (every `open=` timing across the scenarios) | 503–504 → 503–504 MB | 3.1–6.4 s | 3.9–6.4 s |
+| Rotate 90° CW / CCW | 699 → 699 MB | 2.9–3.6 s / 1.4–1.5 s | 4.1 s / 1.8–1.9 s |
+| Full verified save | 807–811 → 806–808 MB | 9.8–10.9 s | 9.6–10.3 s |
+| Verified save after a 1-pixel edit (53/54 bands reused) | – | 6.8–6.9 s | 7.4–7.9 s |
+| Pencil stroke, 21,990 pixels | – | 0.10–0.12 s | 0.10–0.13 s |
+| SHA-256 of the buffer | – | 0.59–0.80 s | 0.65–0.80 s |
+| GUI process (open + window + paint) | 534 → 535 MB | – | – |
+
+The core code is unchanged, so differences in the rows above are run-to-run noise on the
+shared VM (`open` covers the same decode; see also the next table). The window
+benchmark's paint figures are not comparable before/after because the Edit workspace gives
+the canvas a larger viewport than the old layout (no bottom dock, narrower right dock). On
+an identical 1184×784 canvas viewport (`EditorCanvas` alone, same image, five positions,
+medians of two runs each):
+
+| Canvas paint, 1184×784, 100% | Before | After |
+|---|---|---|
+| Cold (tile cache cleared) | 48.8–50.5 ms | 50.0–61.4 ms |
+| Cached | 4.0–4.4 ms | 4.7 ms |
+| After a 64 px scroll | 4.3–5.3 ms | 4.3–4.7 ms |
+| Zoom 100% → 200% | 22.7–29.9 ms | 27.5–31.2 ms |
+
+New interactions in the redesigned window (`ui` scenario, 7488×7487, 1600×1000 window,
+two runs):
+
+| Interaction | Time |
+|---|---|
+| Hover readout (status bar) | 0.01 ms |
+| Inspect a pixel (Pixel panel + hex view) | 0.87–0.90 ms |
+| Hex view repaint | 5.1 ms |
+| Jump hex view to the last byte | 0.85–1.1 ms |
+| Pencil: one mouse move + full-viewport repaint at 400% (mean / max over 200 moves) | 11.1–11.3 / 21.8–25.3 ms |
+| Pencil: release (records the undo step, refreshes panels) | 8.3–9.4 ms |
+| Full-buffer SHA-256 runs started during a 200-move stroke | 0 |
+| Release to SHA-256-confirmed status (includes the 0.5 s debounce, off-thread) | 1.17–1.22 s |
+| Apply a one-pixel edit from the Pixel panel | 4.1–5.4 ms |
+| Refresh every panel after an edit, 522-step history | 4.5–4.6 ms (was 21.6 ms before the History panel became incremental) |
+| Switch workspace | 16–18 ms |
+| Peak RSS of the GUI process | 550 MB |
+
+`python scripts/benchmark.py --size 1024x1024` runs the same scenarios on a small image.
+
 **Expected memory:** the buffer (224 MB) plus the immutable original (224 MB) plus about
 60 MB of runtime. Rotation briefly needs a second buffer, and save verification needs
-the decoder's copy.
+the decoder's copy. The hex view, inspector and integrity panels read the buffer in place
+(no copies); the tile cache is capped at 96 MB of display tiles.
 
 **Before the tiling and dirty-band work**, the same full save took 45 s, opening peaked at
 706 MB and rotation at 930 MB.
@@ -404,12 +488,15 @@ These are not implemented in v0.1.0:
 - **Colour-managed display:** not provided, intentionally. The canvas shows raw values.
 - **Zoomed-out display:** below 100% the editor canvas shows sampled pixels, so a single
   edited pixel may not be visible. The difference heatmap max-pools instead.
-- **Platforms:** developed and tested on macOS only. The code uses only portable APIs
-  (`os.replace`, Qt, NumPy and Pillow; the directory fsync is skipped on Windows), but it
-  has **not been run on Windows or Linux**.
-- **GUI testing:** the GUI is tested headlessly (offscreen Qt with synthetic mouse events)
-  and was checked visually from offscreen screenshots. It has not been exercised by hand
-  on a physical display.
+- **Platforms:** developed on macOS; the test suite and benchmarks also run on Linux
+  (headless). The code uses only portable APIs (`os.replace`, Qt, NumPy and Pillow; the
+  directory fsync is skipped on Windows), but it has **not been run on Windows**.
+- **GUI testing:** the GUI is tested headlessly (offscreen Qt with synthetic mouse and key
+  events) on macOS and Linux and was checked visually from offscreen screenshots. The
+  redesigned workspace has not been exercised by hand on a physical display, a
+  screen reader, or a fractional-scale (e.g. 150%) HiDPI screen.
+- **Themes:** switching theme restyles everything immediately except colours baked into a
+  few already-open dialogs.
 
 ---
 
@@ -431,12 +518,15 @@ eXact/
 │   │   ├── diff.py           # raw buffer / file comparison
 │   │   └── synthetic.py      # deterministic payload-like test images
 │   └── gui/                  # PyQt6
-│       ├── app.py            # entry point
-│       ├── main_window.py    # menus, actions, save/open flows
+│       ├── app.py            # entry point, theme
+│       ├── main_window.py    # workspace layout, actions, workspaces, save/open flows
 │       ├── canvas.py         # tiled zoom/pan view, tools, tile cache
 │       ├── display.py        # display-only conversions (composite, channels, heatmap)
-│       ├── panels.py         # inspector, hex, info, integrity, tool options
+│       ├── panels.py         # tool properties, pixel inspector, integrity, history, info
+│       ├── hexview.py        # virtual hex view of the canonical buffer
 │       ├── diff_dialog.py    # pixel-difference viewer
+│       ├── errors.py         # plain-language error explanations
+│       ├── style.py          # shared design tokens, stylesheet, SVG icons (same file in ImageStore)
 │       └── tasks.py          # background work behind a modal progress dialog
 ├── tests/                    # pytest suite (see above)
 └── scripts/benchmark.py      # peak-RSS / timing benchmark

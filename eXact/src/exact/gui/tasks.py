@@ -3,6 +3,10 @@
 NumPy, zlib, hashlib and Pillow release the GIL for bulk work, so the UI stays live.
 The caller blocks in a nested event loop behind an application-modal progress dialog,
 which keeps the user from mutating the buffer while a worker reads it.
+
+Read-only work (opening a file, comparing files) may be cancelled: the caller stops
+waiting at once and the worker's eventual result is discarded, so no state changes. Work
+that writes (saving, transforms) is never cancellable: its atomic replace must complete.
 """
 
 from __future__ import annotations
@@ -13,7 +17,11 @@ from PyQt6.QtCore import QEventLoop, Qt, QTimer
 from PyQt6.QtWidgets import QApplication, QProgressDialog
 
 
-def run_blocking(parent, label: str, fn, *args, **kwargs):
+class TaskCancelled(Exception):
+    """The user cancelled a read-only task; nothing was changed."""
+
+
+def run_blocking(parent, label: str, fn, *args, cancellable: bool = False, **kwargs):
     outcome: dict = {}
 
     def worker():
@@ -22,12 +30,14 @@ def run_blocking(parent, label: str, fn, *args, **kwargs):
         except BaseException as exc:  # re-raised on the GUI thread
             outcome["error"] = exc
 
-    dialog = QProgressDialog(label, None, 0, 0, parent)
+    dialog = QProgressDialog(label, "Cancel" if cancellable else None, 0, 0, parent)
     dialog.setWindowTitle("eXact")
     dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
     dialog.setMinimumDuration(250)
-    dialog.setCancelButton(None)
+    if not cancellable:
+        dialog.setCancelButton(None)
     dialog.setAutoClose(False)
+    dialog.setAutoReset(False)
     if parent is not None and hasattr(parent, "set_busy"):
         parent.set_busy(True)
     QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -35,13 +45,24 @@ def run_blocking(parent, label: str, fn, *args, **kwargs):
     loop = QEventLoop()
     timer = QTimer()
     timer.setInterval(20)
-    timer.timeout.connect(lambda: None if thread.is_alive() else loop.quit())
+    cancelled = False
+
+    def poll():
+        nonlocal cancelled
+        if cancellable and dialog.wasCanceled():
+            cancelled = True
+            loop.quit()
+        elif not thread.is_alive():
+            loop.quit()
+
+    timer.timeout.connect(poll)
     try:
         thread.start()
         timer.start()
         if thread.is_alive():
             loop.exec()
-        thread.join()
+        if not cancelled:
+            thread.join()
     finally:
         timer.stop()
         dialog.close()
@@ -49,6 +70,8 @@ def run_blocking(parent, label: str, fn, *args, **kwargs):
         QApplication.restoreOverrideCursor()
         if parent is not None and hasattr(parent, "set_busy"):
             parent.set_busy(False)
+    if cancelled:
+        raise TaskCancelled(label)
     if "error" in outcome:
         raise outcome["error"]
     return outcome.get("value")

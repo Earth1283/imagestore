@@ -1,0 +1,148 @@
+[
+  {
+    "png": "binary-compressed.png",
+    "name": "compressible.txt",
+    "kind": "file",
+    "compress_requested": true,
+    "flags": 1,
+    "orig_size": 20000,
+    "stored_size": 103,
+    "sha256": "76ecb3b8a2d75bad41dc12fd49be901d3223cfb9e54cdd57575bf516f69486cf",
+    "width": 7,
+    "height": 7,
+    "pixel_sha256": "eae97a62514386a83b094245d6965c8cfd640747b32c2e1d133bde3c2d2ec613",
+    "content_sha256": "76ecb3b8a2d75bad41dc12fd49be901d3223cfb9e54cdd57575bf516f69486cf"
+  },
+  {
+    "png": "binary-random-raw.png",
+    "name": "random.bin",
+    "kind": "file",
+    "compress_requested": true,
+    "flags": 0,
+    "orig_size": 8192,
+    "stored_size": 8192,
+    "sha256": "80edf202c655a19c20bca525a2b1623fcde3bcc0a14ae670ddd2013df84320a9",
+    "width": 46,
+    "height": 45,
+    "pixel_sha256": "bb2a39a5372e4fd643efdf374c8afbd662199381d9b6c321daa7ef24313fac78",
+    "content_sha256": "80edf202c655a19c20bca525a2b1623fcde3bcc0a14ae670ddd2013df84320a9"
+  },
+  {
+    "png": "binary-nocompress.png",
+    "name": "ramp.bin",
+    "kind": "file",
+    "compress_requested": false,
+    "flags": 0,
+    "orig_size": 3000,
+    "stored_size": 3000,
+    "sha256": "8238f003ad1a7f56965542e097622333a1e90eb52301496c34fe39ab34c2e9e6",
+    "width": 28,
+    "height": 28,
+    "pixel_sha256": "9b090579900e60b4e32435a9a40ac1aa171876aa9474a2b468c5ad2da6ef014e",
+    "content_sha256": "8238f003ad1a7f56965542e097622333a1e90eb52301496c34fe39ab34c2e9e6"
+  },
+  {
+    "png": "empty.png",
+    "name": "empty.dat",
+    "kind": "file",
+    "compress_requested": true,
+    "flags": 0,
+    "orig_size": 0,
+    "stored_size": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "width": 5,
+    "height": 4,
+    "pixel_sha256": "1ea14f221d3788e3189c72b0aa4751ea791013ba2422f127202d861f62de9f9a",
+    "content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "png": "text.png",
+    "name": "text.txt",
+    "kind": "text",
+    "compress_requested": true,
+    "flags": 2,
+    "orig_size": 52,
+    "stored_size": 52,
+    "sha256": "e6901a49c96150b25d8662108dd168ba639da07e9c84ea447042a2557387d5bc",
+    "width": 6,
+    "height": 5,
+    "pixel_sha256": "c817bde7468e81a5f57952296e64873ddec72edf18dd5f8c6f873450a5116f88",
+    "content_sha256": "e6901a49c96150b25d8662108dd168ba639da07e9c84ea447042a2557387d5bc"
+  },
+  {
+    "png": "unicode-name.png",
+    "name": "résumé ✓.txt",
+    "kind": "file",
+    "compress_requested": true,
+    "flags": 1,
+    "orig_size": 500,
+    "stored_size": 14,
+    "sha256": "c38c2bf3055c516a98ac5d97f30e7c364e827bc0199e1c3415b794afbe55dcad",
+    "width": 5,
+    "height": 5,
+    "pixel_sha256": "7d769a57b7cc8bfa8e5c8fd8fc35f3679f9acde34d6c5792b0ff1bef87978a12",
+    "content_sha256": "c38c2bf3055c516a98ac5d97f30e7c364e827bc0199e1c3415b794afbe55dcad"
+  },
+  {
+    "png": "folder.png",
+    "name": "project",
+    "kind": "dir",
+    "compress_requested": true,
+    "flags": 5,
+    "orig_size": 20480,
+    "stored_size": 1532,
+    "sha256": "db94df27ba16e1e673a8f9d5b325179bc97cbfa1f5cfeb7402f06285b2de86cd",
+    "width": 20,
+    "height": 20,
+    "pixel_sha256": "ca42616a4ffdec8af712a368cf8ac101fe4f39082386021bada7508fc1941a45",
+    "files": [
+      {
+        "path": ".DS_Store",
+        "sha256": "ef875a1705a5fdac206be996f4dc1f726ea6b68861eb741c37def7277f179e37"
+      },
+      {
+        "path": "README.md",
+        "sha256": "bc70e26f40b8816eb177813dda1f5f529a27a4641d45aa19cae2348a8c6a5fe9"
+      },
+      {
+        "path": "__pycache__/main.cpython-313.pyc",
+        "sha256": "cc2786e1f9910a9d811400edcddaf7075195f7a16b216dcbefba3bc7c4f2ae51"
+      },
+      {
+        "path": "src/data.bin",
+        "sha256": "77141ace04a7e05a5f58cd2ff5a6fdf0a2366e18f1f7727b157edbe93a8834e0"
+      },
+      {
+        "path": "src/main.py",
+        "sha256": "caf026f25d7140209f98072605307a438914b9ce6f3c14b23d15d9667241de52"
+      }
+    ]
+  },
+  {
+    "png": "folder-autoignore.png",
+    "name": "project",
+    "kind": "dir",
+    "compress_requested": true,
+    "flags": 5,
+    "orig_size": 20480,
+    "stored_size": 1434,
+    "sha256": "596c846d7159f6348ad97683b253e492a60c436a19d3e5a89a442f671e83cacc",
+    "width": 20,
+    "height": 19,
+    "pixel_sha256": "3d520f9ca8d702ef97042b05b8959a79d711e31a1a0e96f321e266ea3947d9ff",
+    "files": [
+      {
+        "path": "README.md",
+        "sha256": "bc70e26f40b8816eb177813dda1f5f529a27a4641d45aa19cae2348a8c6a5fe9"
+      },
+      {
+        "path": "src/data.bin",
+        "sha256": "77141ace04a7e05a5f58cd2ff5a6fdf0a2366e18f1f7727b157edbe93a8834e0"
+      },
+      {
+        "path": "src/main.py",
+        "sha256": "caf026f25d7140209f98072605307a438914b9ce6f3c14b23d15d9667241de52"
+      }
+    ]
+  }
+]

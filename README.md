@@ -1,5 +1,8 @@
 # ImageStore
 
+> **ImageStore** — *Turn files into pixels. Recover them exactly.*
+> **eXact** — *Edit what you intend. Preserve what you don't.*
+
 Stash any file, folder or string inside an RGBA PNG. All four channels carry data (R, G, B
 **and alpha**), so the image is a dense, lossless container for arbitrary bytes. Every
 payload is protected by a SHA-256 digest, so a decode either returns exactly what you put
@@ -9,7 +12,7 @@ This repository contains two tools:
 
 | Directory | What it is |
 |---|---|
-| [`imagestore/`](imagestore/) | The encoder/decoder: a single-file Python CLI with an interactive menu. |
+| [`imagestore/`](imagestore/) | The encoder/decoder: a single-file Python CLI with an interactive menu, plus an optional graphical interface. |
 | [`eXact/`](eXact/) | A binary-preserving PNG pixel editor, for editing ImageStore images without corrupting the payload. See its [README](eXact/README.md). |
 
 ## Installation
@@ -21,7 +24,8 @@ Python 3.8 or newer (developed on 3.14; the code uses the walrus operator and
 cd imagestore
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt     # Pillow, rich
+pip install -r requirements.txt     # Pillow, rich: everything the command line needs
+pip install -r requirements-gui.txt # optional: PyQt6 for the graphical interface
 ```
 
 ## Usage
@@ -33,8 +37,18 @@ python imagestore.py encode report.pdf        # -> report.pdf.png
 python imagestore.py encode ./my-folder       # folders are tarred first
 python imagestore.py encode -t "some text"    # -> text.png
 python imagestore.py decode report.pdf.png    # restores report.pdf next to the image
-python imagestore.py info report.pdf.png      # metadata + integrity check
+python imagestore.py info report.pdf.png      # metadata + integrity check (exit 1 if it fails)
+python imagestore.py -g                       # graphical interface (optional, needs PyQt6)
 ```
+
+The command line never starts the GUI on its own. Open it with `-g` / `--gui`, or with `g` in
+the interactive menu. It has Encode, Decode and Inspect pages with drag-and-drop, progress
+and cancellation, compression statistics, a reviewable list of auto-ignored folder entries,
+and plain-language explanations when something fails.
+
+Every encode is verified before it is reported as done: the PNG is written to a temporary
+file next to the destination, decoded again, checked against its SHA-256 and only then
+moved into place. `--no-verify` skips the check.
 
 ### Options
 
@@ -44,12 +58,20 @@ python imagestore.py info report.pdf.png      # metadata + integrity check
 | `encode` | `-t, --text TEXT` | Encode a string instead of a file |
 | `encode` | `--no-compress` | Skip zlib pre-compression |
 | `encode` | `-f, --force` | Overwrite an existing output |
+| `encode` | `--no-verify` | Skip decoding the written PNG to confirm it (faster, not recommended) |
 | `encode` | `--auto-ignore` / `--no-auto-ignore` | Folders: skip (or keep) junk such as `.DS_Store`, `node_modules`, `__pycache__`, `.git`, `.venv`. By default it asks when run interactively and includes everything when scripted. |
 | `decode` | `-o, --output-dir DIR` | Restore into `DIR` (default: next to the image) |
 | `decode` | `-f, --force` | Overwrite existing output |
+| *(none)* | `-g, --gui` | Open the graphical interface |
 
 Text payloads are printed by `decode` instead of being written to a file. Decoded data is
-only committed after the size and SHA-256 checks pass.
+only committed after the size and SHA-256 checks pass; folders are extracted into a staging
+folder first, so a failed restore leaves nothing behind.
+
+Errors go to stderr with a short explanation and a hint (for example *Integrity check
+failed (SHA-256 mismatch)*, *Not an ImageStore image*, *Not enough disk space*), so piped
+output such as decoded text is never mixed with messages. Exit codes: `0` success, `1`
+error or failed integrity check, `130` interrupted.
 
 ## How it works
 
@@ -93,4 +115,26 @@ python imagestore.py decode imagestore.py.png -o restored
 ```
 
 It will go stale whenever the script changes, so re-encode it with
-`python imagestore.py encode imagestore.py -f`.
+`python imagestore.py encode imagestore.py -f`. Archives made by earlier versions of the
+script stay readable; `imagestore/tests/fixtures/legacy/` holds frozen examples that the
+test suite decodes on every run.
+
+## Screenshots
+
+| | |
+|---|---|
+| ![eXact, Edit workspace](docs/screenshots/exact-edit.png) | ![eXact, Inspect workspace](docs/screenshots/exact-inspect.png) |
+| eXact, Edit workspace: tool palette, exact RGBA pencil with per-channel write mask, pixel inspector next to original values, history. | eXact, Inspect workspace: hex bytes of the canonical buffer, integrity status. |
+| ![ImageStore GUI, encoding a folder](docs/screenshots/imagestore-gui-encode.png) | ![ImageStore GUI, tampered archive](docs/screenshots/imagestore-gui-inspect.png) |
+| ImageStore GUI: encoding a folder with the auto-ignore review. | ImageStore GUI: Inspect catches a modified archive. |
+
+![ImageStore in a terminal](docs/screenshots/imagestore-tui.png)
+
+## Shared design
+
+Both applications use the same dark-first visual language: colour tokens, a Qt stylesheet
+and a HiDPI-safe SVG icon set live in one `style.py`, kept byte-identical in
+`eXact/src/exact/gui/` and `imagestore/imagestore_gui/` (a test fails if they drift), so
+each tool still installs and runs on its own.
+
+*Code is Art.\** — *\*Handle with care.*
