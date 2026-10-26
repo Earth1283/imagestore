@@ -367,3 +367,32 @@ def test_large_targets_preview_the_visible_area_but_apply_everywhere(window, tmp
     assert np.array_equal(pending.values, full[r.y:r.y1, r.x:r.x1])
     dialog.apply()
     assert np.array_equal(window.doc.pixels, full)
+
+
+@pytest.mark.parametrize("how", ["close", "reject", "accept", "escape", "deleted"])
+def test_reopening_a_filter_after_the_dialog_went_away(window, rgba_png, how):
+    """Esc/reject delete the dialog without a closeEvent; reopening must not touch the dead object."""
+    from PyQt6 import sip
+    from PyQt6.QtCore import QEvent, Qt
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QApplication
+
+    assert window.open_path(rgba_png)
+    window.open_filter("invert")
+    dialog = window.power_dialog
+    dialog.actions.preview_button.setChecked(True)
+    assert window.pending is not None
+    if how == "escape":
+        dialog.activateWindow()
+        QTest.keyClick(dialog, Qt.Key.Key_Escape)
+    elif how == "deleted":
+        sip.delete(dialog)
+    else:
+        getattr(dialog, how)()
+    QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+    assert window.power_dialog is None
+    if how != "deleted":
+        assert window.pending is None  # dismissing the dialog discards its staged preview
+    window.open_filter("blur")
+    assert window.power_dialog is not None and not sip.isdeleted(window.power_dialog)

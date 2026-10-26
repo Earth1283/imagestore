@@ -17,6 +17,7 @@ import os
 import threading
 import time
 
+from PyQt6 import sip
 from PyQt6.QtCore import QObject, QSettings, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QActionGroup, QIcon, QKeySequence
 from PyQt6.QtWidgets import (
@@ -236,7 +237,7 @@ class MainWindow(QMainWindow):
         self.pending: Pending | None = None  # a power-tool result shown on the canvas, not yet applied
         self._pending_input: tuple | None = None  # what produced a bucket/shape preview, for re-tuning
         self.power_ids: set[int] = set()  # history commands made by power tools
-        self.power_dialog: PowerFilterDialog | None = None
+        self._power_dialog: PowerFilterDialog | None = None
         self.setWindowIcon(style.app_icon("logo-exact"))
         self.resize(1440, 900)
         self.setAcceptDrops(True)
@@ -985,6 +986,17 @@ class MainWindow(QMainWindow):
         self.tool_panel.set_shape(kind)
         self._tool_settings_changed()
         self.set_tool("shape")
+
+    @property
+    def power_dialog(self) -> PowerFilterDialog | None:
+        """The open Power Tools dialog; None once Qt has deleted it, however it was dismissed."""
+        if self._power_dialog is not None and sip.isdeleted(self._power_dialog):
+            self._power_dialog = None
+        return self._power_dialog
+
+    @power_dialog.setter
+    def power_dialog(self, dialog: PowerFilterDialog | None) -> None:
+        self._power_dialog = dialog
 
     def open_filter(self, key: str) -> None:
         if self.doc is None:

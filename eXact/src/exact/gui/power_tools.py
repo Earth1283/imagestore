@@ -783,9 +783,16 @@ class PowerFilterDialog(QDialog):
             self.window_.clear_pending()
         self.refresh_state()
 
-    def closeEvent(self, event) -> None:
+    def _release(self) -> None:
         if self.window_.pending is not None and self.window_.pending.source == self.key:
             self.window_.clear_pending()
         if self.window_.power_dialog is self:
             self.window_.power_dialog = None
+
+    def done(self, result: int) -> None:  # Esc and reject() delete the dialog without a closeEvent
+        self._release()
+        super().done(result)
+
+    def closeEvent(self, event) -> None:
+        self._release()
         super().closeEvent(event)
