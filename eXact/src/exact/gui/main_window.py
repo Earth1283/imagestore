@@ -2,6 +2,7 @@
 
     top     menu bar and one compact toolbar (file, history, zoom, view, workspace)
     left    tool palette (inspect, pencil, eyedropper, select, hand, zoom, transforms)
+    top     ... plus the hazard-taped Power Tools section (bucket, shapes, filters)
     centre  the canvas
     right   Tool properties, Pixel inspector, History
     bottom  Hex bytes, Integrity details, Image info (collapsible, tabbed)
@@ -32,6 +33,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QScrollArea,
     QSizePolicy,
@@ -43,9 +45,9 @@ from PyQt6.QtWidgets import (
 )
 
 from .. import MOTTO, TAGLINE, __version__
-from ..core import transforms
+from ..core import power, transforms
 from ..core.document import ChannelMismatchError, Clip, Document, OperationSummary, Rect
-from ..core.history import TransformCommand
+from ..core.history import RectPatch, TransformCommand
 from ..core.pixels import pixel_offset
 from . import style
 from .canvas import ZOOM_LEVELS, EditorCanvas, zoom_label
@@ -64,6 +66,7 @@ from .panels import (
     short_path,
     swatch,
 )
+from .power_tools import FILTERS, Pending, PowerFilterDialog, PowerToolsSection, clip_mask, mask_pending
 from .tasks import TaskCancelled, run_blocking
 
 HEAVY_PIXELS = 4_000_000
@@ -99,6 +102,12 @@ TOOLS = (
     ("hand", "Hand", "hand", "H"),
     ("zoom", "Zoom", "zoom", "Z"),
 )
+POWER_TOOLS = (
+    ("bucket", "Paint Bucket", "bucket", "G"),
+    ("shape", "Shapes", "shapes", "U"),
+)
+SHAPE_ACTIONS = (("line", "Line", "shape-line"), ("rect", "Rectangle", "shape-rect"),
+                 ("ellipse", "Ellipse", "shape-ellipse"))
 DISPLAY_CHOICES = (
     ("composite", "Composite", "Composite over a checkerboard (alpha applied for display only)"),
     ("rgb", "RGB, ignore alpha", "Raw RGB with alpha ignored: reveals data hidden under transparent pixels"),
@@ -224,6 +233,10 @@ class MainWindow(QMainWindow):
         self.hashed_at: float | None = None
         self.workspace: str | None = None
         self.tool_settings = ToolSettings()
+        self.pending: Pending | None = None  # a power-tool result shown on the canvas, not yet applied
+        self._pending_input: tuple | None = None  # what produced a bucket/shape preview, for re-tuning
+        self.power_ids: set[int] = set()  # history commands made by power tools
+        self.power_dialog: PowerFilterDialog | None = None
         self.setWindowIcon(style.app_icon("logo-exact"))
         self.resize(1440, 900)
         self.setAcceptDrops(True)
@@ -269,6 +282,10 @@ class MainWindow(QMainWindow):
         self.hash_timer.setSingleShot(True)
         self.hash_timer.setInterval(500)
         self.hash_timer.timeout.connect(self._start_hashing)
+        self.retune_timer = QTimer(self)
+        self.retune_timer.setSingleShot(True)
+        self.retune_timer.setInterval(120)
+        self.retune_timer.timeout.connect(self._retune_pending)
 
         self._build_actions()
         self._build_menus()
@@ -281,12 +298,12 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------- construction
 
     def _action(self, text, slot=None, shortcut=None, checkable=False, tip=None, icon=None,
-                toggle: bool = False) -> QAction:
+                toggle: bool = False, on_tone: str = "accent") -> QAction:
         """toggle=True connects *slot* to toggled(bool), so it also runs when the state is set
         from code (setChecked); otherwise to triggered (user activation only)."""
         action = QAction(text, self)
         if icon:
-            action.setIcon(style.icon(icon))
+            action.setIcon(style.icon(icon, on_tone=on_tone))
         if shortcut is not None:
             if isinstance(shortcut, (list, tuple)):
                 action.setShortcuts([QKeySequence(s) for s in shortcut])
@@ -350,7 +367,31 @@ class MainWindow(QMainWindow):
             act = a(label, lambda _=False, t=tool: self.set_tool(t), key, checkable=True, icon=icon)
             self.tool_group.addAction(act)
             self.act_tools[tool] = act
+        for tool, label, icon, key in POWER_TOOLS:
+            act = a(label, lambda _=False, t=tool: self.set_tool(t), key, checkable=True, icon=icon, on_tone="warning",
+                    tip=f"{label} (power tool): previewed on the canvas, written only when you apply")
+            act.setObjectName(f"tool-{tool}")
+            self.tool_group.addAction(act)
+            self.act_tools[tool] = act
         self.act_tools["inspect"].setChecked(True)
+        self.act_shapes = {}
+        shape_group = QActionGroup(self)
+        for kind, label, icon in SHAPE_ACTIONS:
+            act = a(label, lambda _=False, k=kind: self.choose_shape(k), checkable=True, icon=icon, on_tone="warning",
+                    tip=f"{label}: drag on the canvas to preview, Shift constrains")
+            shape_group.addAction(act)
+            self.act_shapes[kind] = act
+        self.act_shapes[self.tool_settings.shape].setChecked(True)
+        self.act_filters = {}
+        for key, spec in FILTERS.items():
+            self.act_filters[key] = a(f"{spec.title}…", lambda _=False, k=key: self.open_filter(k), icon=spec.icon,
+                                      tip=f"{spec.title} (power tool): {spec.tagline}")
+        self.act_power_apply = a("Apply Preview", lambda: self.apply_pending(self.pending), icon="check",
+                                 tip="Write the previewed power-tool result into the buffer (Enter on the canvas)")
+        self.act_power_discard = a("Discard Preview", self.clear_pending, icon="close",
+                                   tip="Throw the preview away (Esc on the canvas); the buffer was never touched")
+        self.act_power_undo = a("Undo Last Power Tool", self.undo_power, icon="undo",
+                                tip="Undo the most recent step if a power tool made it")
         self.act_size_down = a("Smaller Pencil", lambda: self._nudge_size(-1), "[")
         self.act_size_up = a("Larger Pencil", lambda: self._nudge_size(1), "]")
         self.act_workspaces = {}
@@ -421,11 +462,26 @@ class MainWindow(QMainWindow):
             theme.addAction(act)
 
         m = mb.addMenu("&Tools")
-        for act in self.act_tools.values():
-            m.addAction(act)
+        for tool, *_ in TOOLS:
+            m.addAction(self.act_tools[tool])
         m.addSeparator()
         m.addAction(self.act_size_down)
         m.addAction(self.act_size_up)
+
+        m = mb.addMenu("Po&wer Tools")
+        m.setToolTipsVisible(True)
+        note = m.addAction(style.icon("bolt", "warning"), "Previewed first, one undo away. Still a bad idea for payloads.")
+        note.setEnabled(False)
+        m.addSection("Paint")
+        m.addAction(self.act_tools["bucket"])
+        for act in self.act_shapes.values():
+            m.addAction(act)
+        m.addSection("Filters")
+        for act in self.act_filters.values():
+            m.addAction(act)
+        m.addSeparator()
+        for act in (self.act_power_apply, self.act_power_discard, self.act_power_undo):
+            m.addAction(act)
 
         m = mb.addMenu("&Help")
         m.addAction(self.act_shortcuts)
@@ -474,6 +530,13 @@ class MainWindow(QMainWindow):
         self.split_action = tb.addWidget(self.split_slider)
         tb.addSeparator()
         tb.addAction(self.act_compare)
+        tb.addSeparator()
+        self.shape_menu = QMenu(self)
+        for act in self.act_shapes.values():
+            self.shape_menu.addAction(act)
+        self.power_section = PowerToolsSection(
+            [self.act_tools["bucket"], self.act_tools["shape"], None, *self.act_filters.values()], self.shape_menu)
+        tb.addWidget(self.power_section)
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         tb.addWidget(spacer)
@@ -487,8 +550,8 @@ class MainWindow(QMainWindow):
         pal.setOrientation(Qt.Orientation.Vertical)
         pal.setIconSize(QSize(20, 20))
         self.addToolBar(Qt.ToolBarArea.LeftToolBarArea, pal)
-        for act in self.act_tools.values():
-            pal.addAction(act)
+        for tool, *_ in TOOLS:
+            pal.addAction(self.act_tools[tool])
         pal.addSeparator()
         for op in (transforms.ROTATE_CCW, transforms.ROTATE_CW, transforms.FLIP_H, transforms.FLIP_V):
             pal.addAction(self.act_transforms[op])
@@ -522,11 +585,21 @@ class MainWindow(QMainWindow):
         c.zoomChanged.connect(self._zoom_changed)
         c.hoverChanged.connect(self._hover_changed)
         c.pixelPicked.connect(self.set_inspected)
+        c.pixelPicked.connect(lambda x, y: self.power_dialog and self.power_dialog.focus_on(x, y))
         c.strokeFinished.connect(self._stroke_finished)
         c.colorPicked.connect(self._color_picked)
         c.selectionChanged.connect(lambda _: self._selection_changed())
         c.pasteCommitted.connect(self._paste_commit)
         c.pasteCancelled.connect(lambda: self.statusBar().showMessage("Paste cancelled", 3000))
+        c.bucketClicked.connect(self._bucket)
+        c.shapeDrawn.connect(self._shape)
+        c.pendingApplyRequested.connect(lambda: self.apply_pending(self.pending))
+        c.pendingDiscardRequested.connect(self.clear_pending)
+        pw = self.tool_panel.power
+        pw.previewToggled.connect(self.show_pending)
+        pw.applyRequested.connect(lambda: self.apply_pending(self.pending))
+        pw.discardRequested.connect(self.clear_pending)
+        pw.undoRequested.connect(self.undo_power)
         self.inspector.applyRequested.connect(self._apply_pixel)
         self.inspector.useAsColor.connect(self.tool_panel.set_color)
         self.inspector.gotoRequested.connect(self.goto_pixel)
@@ -608,13 +681,21 @@ class MainWindow(QMainWindow):
         self.canvas.busy = busy
 
     def set_tool(self, tool: str) -> None:
+        if self.pending is not None and self.pending.source in ("bucket", "shape") and tool != self.pending.source:
+            self.clear_pending()
+            self.statusBar().showMessage("Preview discarded (tool changed); the buffer was never touched.", 5000)
         self.canvas.set_tool(tool)
         self.act_tools[tool].setChecked(True)
         self.tool_panel.set_tool(tool)
-        if tool in ("pencil", "select", "eyedropper") and self.workspace == "edit":
+        if tool in ("pencil", "select", "eyedropper", "bucket", "shape") and self.workspace == "edit":
             self.docks["tool"].show()
 
     def set_document(self, doc: Document | None) -> None:
+        if self.power_dialog is not None:
+            self.power_dialog.close()
+        self.pending = None
+        self._pending_input = None
+        self.power_ids.clear()
         self.doc = doc
         self.hashes = None
         self.hashed_at = None
@@ -636,6 +717,9 @@ class MainWindow(QMainWindow):
         """Refresh views after an operation completes (never per mouse move): counters are
         O(1), the history list is short, and the full SHA-256 is debounced off-thread."""
         doc = self.doc
+        if self.pending is not None and (doc is None or self.pending.generation != doc.generation):
+            self.pending = None  # computed from pixels that have since changed
+            self.canvas.set_pending(None, visible=True)
         if summary is not None:
             self.statusBar().showMessage(summary.describe(), 15000)
         if region is not None:
@@ -658,6 +742,9 @@ class MainWindow(QMainWindow):
         self._update_title()
         self._update_actions()
         self._selection_changed()
+        if self.power_dialog is not None:
+            self.power_dialog.document_changed()
+        self.refresh_power_state()
 
     def _update_status(self) -> None:
         doc = self.doc
@@ -701,6 +788,9 @@ class MainWindow(QMainWindow):
         self.act_undo.setToolTip(f"Undo {h.undo_label}  (Ctrl+Z)" if h and h.can_undo else "Nothing to undo")
         self.act_redo.setToolTip(f"Redo {h.redo_label}  (Ctrl+Shift+Z)" if h and h.can_redo else "Nothing to redo")
         self.act_restore_pixel.setEnabled(has and self.canvas.inspected is not None)
+        for act in (*self.act_filters.values(), *self.act_shapes.values(), self.act_tools["bucket"],
+                    self.act_tools["shape"]):
+            act.setEnabled(has)
 
     def _start_hashing(self) -> None:
         if self.doc is None:
@@ -773,6 +863,11 @@ class MainWindow(QMainWindow):
 
     def _tool_settings_changed(self) -> None:
         ts = self.tool_settings
+        self.act_shapes[ts.shape].setChecked(True)
+        self.act_tools["shape"].setIcon(style.icon(dict((k, i) for k, _, i in SHAPE_ACTIONS)[ts.shape],
+                                                   on_tone="warning"))
+        if self.pending is not None and self._pending_input and self.pending.source == self._pending_input[0]:
+            self.retune_timer.start()
         self.color_chip.setIcon(QIcon(swatch(ts.color, 14, self.color_chip)))
         self.color_chip.setToolTip(f"Pencil colour #{''.join(f'{v:02X}' for v in ts.color)}, size {ts.size}px. "
                                    "Click for pencil settings.")
@@ -870,6 +965,135 @@ class MainWindow(QMainWindow):
         current = len(self.doc.history)
         for _ in range(abs(position - current)):
             (self.undo if position < current else self.redo)()
+
+    # ---------------------------------------------------------------- power tools
+
+    def power_target(self) -> Rect:
+        """Where filters apply: the selection, or the whole image."""
+        if self.canvas.selection is not None:
+            return self.canvas.selection.clamp(self.doc.width, self.doc.height)
+        return Rect(0, 0, self.doc.width, self.doc.height)
+
+    def run_heavy(self, label: str, pixels: int, fn, *args):
+        """Run *fn* behind the progress dialog when it touches a lot of pixels."""
+        if pixels >= HEAVY_PIXELS:
+            return run_blocking(self, label, fn, *args)
+        return fn(*args)
+
+    def choose_shape(self, kind: str) -> None:
+        self.tool_settings.shape = kind
+        self.tool_panel.set_shape(kind)
+        self._tool_settings_changed()
+        self.set_tool("shape")
+
+    def open_filter(self, key: str) -> None:
+        if self.doc is None:
+            return
+        if self.power_dialog is not None:
+            self.power_dialog.close()
+        self.power_dialog = PowerFilterDialog(self, key)
+        self.power_dialog.show()
+        self.power_dialog.raise_()
+
+    def set_pending(self, pending: Pending | None) -> None:
+        self.pending = pending
+        if pending is None or pending.source not in ("bucket", "shape"):
+            self._pending_input = None
+        self.canvas.set_pending(pending, visible=True)
+        self.refresh_power_state()
+        if pending is not None:
+            self.statusBar().showMessage(f"Preview: {pending.label}, {pending.describe()}. Not applied: Enter "
+                                         "applies, Esc discards.", 15000)
+
+    def clear_pending(self) -> None:
+        if self.pending is not None:
+            self.set_pending(None)
+
+    def show_pending(self, on: bool) -> None:
+        """Preview toggle: show the staged result, or the untouched buffer, on the canvas."""
+        if self.pending is not None:
+            self.canvas.set_pending(self.pending, visible=on)
+        self.refresh_power_state()
+
+    def apply_pending(self, pending: Pending | None) -> OperationSummary | None:
+        doc = self.doc
+        if doc is None or pending is None:
+            return None
+        if pending.partial and self.power_dialog is not None:
+            self.power_dialog.apply()  # a visible-area preview: compute the whole target
+            return doc.last_operation
+        if pending.generation != doc.generation:
+            self.clear_pending()
+            self.statusBar().showMessage("The preview was out of date and has been discarded. Nothing was written.",
+                                         8000)
+            return None
+        self.pending = None
+        self._pending_input = None
+        self.canvas.set_pending(None, visible=True)
+        summary = self.run_heavy(f"Applying {pending.label}…", pending.count, pending.commit, doc)
+        top = doc.history.peek_undo()
+        if top is not None and summary.changed_pixels:
+            self.power_ids.add(top.id)
+        self.document_changed(summary, region=pending.rect)
+        return summary
+
+    def can_undo_power(self) -> bool:
+        top = self.doc.history.peek_undo() if self.doc else None
+        return top is not None and top.id in self.power_ids
+
+    def undo_power(self) -> None:
+        if self.can_undo_power():
+            self.undo()
+
+    def refresh_power_state(self) -> None:
+        pending = self.pending
+        mine = pending if pending is not None and pending.source in ("bucket", "shape") else None
+        can_undo = self.can_undo_power()
+        self.tool_panel.set_pending(mine, can_undo=can_undo, previewing=self.canvas.show_pending)
+        if self.power_dialog is not None:
+            self.power_dialog.refresh_state()
+        self.act_power_apply.setEnabled(pending is not None)
+        self.act_power_discard.setEnabled(pending is not None)
+        self.act_power_undo.setEnabled(can_undo)
+
+    def _bucket(self, x: int, y: int) -> None:
+        doc, ts = self.doc, self.tool_settings
+        if doc is None:
+            return
+        found = self.run_heavy("Finding pixels to fill…", doc.width * doc.height if not ts.contiguous else 0,
+                               power.flood_fill, doc.pixels, x, y, ts.tolerance, ts.contiguous)
+        found = clip_mask(found, self.canvas.selection)
+        self._stage(mask_pending(found, label=f"Paint bucket at ({x}, {y})", source="bucket", verb="Fill", doc=doc,
+                                 color=ts.color, write_mask=ts.mask), ("bucket", x, y),
+                    "Nothing to fill inside the selection.")
+
+    def _shape(self, ax: int, ay: int, bx: int, by: int) -> None:
+        doc, ts = self.doc, self.tool_settings
+        if doc is None:
+            return
+        spans = power.shape_spans(ts.shape, ax, ay, bx, by, ts.stroke, ts.filled)
+        found = clip_mask(power.spans_to_mask(*spans, doc.width, doc.height), self.canvas.selection)
+        name = dict((k, label) for k, label, _ in SHAPE_ACTIONS)[ts.shape]
+        style_note = "filled" if ts.filled and ts.shape != "line" else f"{ts.stroke} px"
+        self._stage(mask_pending(found, label=f"{name} ({ax}, {ay})–({bx}, {by}), {style_note}", source="shape",
+                                 verb="Draw", doc=doc, color=ts.color, write_mask=ts.mask), ("shape", ax, ay, bx, by),
+                    "That shape lies outside the image (or the selection).")
+
+    def _stage(self, pending: Pending | None, source: tuple, empty_note: str) -> None:
+        if pending is None:
+            self.clear_pending()
+            self.statusBar().showMessage(empty_note, 5000)
+            return
+        self.set_pending(pending)
+        self._pending_input = source
+
+    def _retune_pending(self) -> None:
+        """Bucket and shape previews follow the Tool panel: change tolerance, stroke or
+        colour and the preview is recomputed from the same click or drag."""
+        src = self._pending_input
+        if self.pending is None or not src or self.pending.source != src[0]:
+            return
+        (self._bucket if src[0] == "bucket" else self._shape)(*src[1:])
 
     # ---------------------------------------------------------------- files
 
@@ -1024,23 +1248,31 @@ class MainWindow(QMainWindow):
             return run_blocking(self, label, fn, *args)
         return fn(*args)
 
+    @staticmethod
+    def _heavy_command(command) -> bool:
+        if isinstance(command, TransformCommand):
+            return True
+        return isinstance(command, RectPatch) and command.before.shape[0] * command.before.shape[1] >= HEAVY_PIXELS
+
     def undo(self) -> None:
         if self.doc is None:
             return
-        heavy = isinstance(self.doc.history.peek_undo(), TransformCommand)
+        command = self.doc.history.peek_undo()
+        heavy = self._heavy_command(command)
         summary = self._maybe_blocking("Undoing…", self.doc.undo) if heavy else self.doc.undo()
         if summary is not None:
-            if heavy:
+            if isinstance(command, TransformCommand):
                 self.canvas.set_selection(None)
             self.document_changed(summary)
 
     def redo(self) -> None:
         if self.doc is None:
             return
-        heavy = isinstance(self.doc.history.peek_redo(), TransformCommand)
+        command = self.doc.history.peek_redo()
+        heavy = self._heavy_command(command)
         summary = self._maybe_blocking("Redoing…", self.doc.redo) if heavy else self.doc.redo()
         if summary is not None:
-            if heavy:
+            if isinstance(command, TransformCommand):
                 self.canvas.set_selection(None)
             self.document_changed(summary)
 
@@ -1157,7 +1389,8 @@ class MainWindow(QMainWindow):
                           self.act_fill, self.act_select_all, self.act_deselect, self.act_goto]),
                 ("View", [self.act_zoom_in, self.act_zoom_out, self.act_zoom_100, self.act_zoom_fit, self.act_grid,
                           self.act_show_original, self.act_highlight, *self.act_workspaces.values()]),
-                ("Image", [self.act_transforms[transforms.ROTATE_CW], self.act_transforms[transforms.ROTATE_CCW]])):
+                ("Image", [self.act_transforms[transforms.ROTATE_CW], self.act_transforms[transforms.ROTATE_CCW]]),
+                ("Power Tools", [self.act_tools["bucket"], self.act_tools["shape"]])):
             rows.append(f"<tr><td colspan=2><br><b>{title}</b></td></tr>")
             for act in actions:
                 keys = act.shortcut().toString(QKeySequence.SequenceFormat.NativeText)
@@ -1166,7 +1399,9 @@ class MainWindow(QMainWindow):
                     rows.append(f"<tr><td style='padding-right:24px'>{name}</td><td><tt>{keys}</tt></td></tr>")
         rows.append("<tr><td colspan=2><br><b>Canvas</b></td></tr>")
         for name, keys in (("Pan", "Space+drag, middle-drag, scroll"), ("Zoom at cursor", "Ctrl+scroll"),
-                           ("Pick colour (Pencil)", "Alt+click"), ("Cancel paste", "Esc / right-click")):
+                           ("Pick colour (Pencil)", "Alt+click"), ("Cancel paste", "Esc / right-click"),
+                           ("Apply / discard a power-tool preview", "Enter / Esc"),
+                           ("Constrain shape (square, circle, 45°)", "Shift+drag")):
             rows.append(f"<tr><td style='padding-right:24px'>{name}</td><td><tt>{keys}</tt></td></tr>")
         QMessageBox.information(self, "Keyboard shortcuts", "<table>" + "".join(rows) + "</table>")
 

@@ -28,6 +28,7 @@ from .pixels import (
     buffer_sha256,
     channels_for_mode,
     diff_counts,
+    pixel_changes,
     validate_buffer,
 )
 from .png_chunks import ChunkLayout, file_sha256
@@ -288,7 +289,7 @@ class Document:
 
     def _record_sparse(self, label: str, ys, xs, before, touched: int) -> OperationSummary:
         after = self.pixels[ys, xs]
-        changed = (before != after).any(axis=1)
+        changed = pixel_changes(before, after)
         ys, xs, before, after = ys[changed], xs[changed], before[changed], after[changed]
         summary = OperationSummary(
             label, int(changed.sum()), int((before != after).sum()), _bbox_of(ys, xs), touched_pixels=touched)
@@ -301,26 +302,25 @@ class Document:
         self._touch(summary.bbox)
         return summary
 
-    def _record_rect(self, label: str, rect: Rect, before: np.ndarray) -> OperationSummary:
+    def _record_rect(self, label: str, rect: Rect, before: np.ndarray,
+                     after: np.ndarray | None = None) -> OperationSummary:
+        """*after*, when given, must already equal the region and is kept as the redo copy."""
         region = self.pixels[rect.y:rect.y1, rect.x:rect.x1]
-        neq = region != before
-        changed = neq.any(axis=2)
-        ys, xs = np.nonzero(changed)
-        summary = OperationSummary(
-            label, int(changed.sum()), int(neq.sum()), _bbox_of(ys + rect.y, xs + rect.x),
-            touched_pixels=rect.w * rect.h)
+        pixels, bytes_, bbox = _rect_changes(before, region, rect.x, rect.y)
+        summary = OperationSummary(label, pixels, bytes_, bbox, touched_pixels=rect.w * rect.h)
         self.last_operation = summary
         if summary.changed_pixels == 0:
             return summary
         ref = self.reference()[rect.y:rect.y1, rect.x:rect.x1]
         self._adjust_content_diff(before, region, ref)
-        self.history.push(RectPatch(label, x0=rect.x, y0=rect.y, before=before, after=region.copy()))
+        self.history.push(RectPatch(label, x0=rect.x, y0=rect.y, before=before,
+                                    after=region.copy() if after is None else after))
         self._touch(rect)
         return summary
 
     def _adjust_content_diff(self, before: np.ndarray, after: np.ndarray, ref: np.ndarray, sign: int = 1) -> None:
-        bp, bb = diff_counts(before, ref)
-        ap, ab = diff_counts(after, ref)
+        bp, bb = _strip_diff(before, ref)
+        ap, ab = _strip_diff(after, ref)
         self.content_diff_pixels += sign * (ap - bp)
         self.content_diff_bytes += sign * (ab - bb)
 
@@ -448,6 +448,62 @@ class Document:
             self.last_operation = summary
         return summary
 
+    def paint_mask(self, left: int, top: int, mask: np.ndarray, color, mask_channels=None,
+                   label: str = "Paint") -> OperationSummary:
+        """Write *color* into the ticked channels of every pixel where *mask* (a bool array
+        whose top-left corner is at (left, top)) is set. Untouched pixels stay untouched.
+
+        The undo step is stored whichever way is smaller: coordinates of the painted pixels
+        for thin shapes, or a copy of the bounding box for dense fills.
+        """
+        self._finish_stroke()
+        color, channels = self._color(color), np.nonzero(self._mask(mask_channels))[0]
+        h, w = mask.shape
+        rect = Rect(left, top, w, h)
+        if rect.clamp(self.width, self.height) != rect:
+            raise ValueError("paint mask extends outside the image")
+        count = int(np.count_nonzero(mask))
+        if count * (16 + 2 * self.channels) < 2 * w * h * self.channels:
+            ys, xs = np.nonzero(mask)
+            ys, xs = ys + top, xs + left
+            before = self.pixels[ys, xs]
+            for c in channels:
+                self.pixels[ys, xs, c] = color[c]
+            return self._record_sparse(label, ys, xs, before, touched=count)
+        region = self.pixels[rect.y:rect.y1, rect.x:rect.x1]
+        before = region.copy()
+        for c in channels:
+            region[..., c][mask] = color[c]
+        summary = self._record_rect(label, rect, before)
+        return self._with_touched(summary, count)
+
+    def commit_region(self, rect: Rect, values: np.ndarray, label: str) -> OperationSummary:
+        """Replace *rect* with precomputed *values* (a power-tool result). *values* is kept
+        as the redo copy, so the caller must not modify it afterwards."""
+        self._finish_stroke()
+        if values.shape != (rect.h, rect.w, self.channels) or values.dtype != np.uint8:
+            raise ValueError("region values do not match the rectangle")
+        if rect.clamp(self.width, self.height) != rect:
+            raise ValueError("region extends outside the image")
+        before = self.pixels[rect.y:rect.y1, rect.x:rect.x1].copy()
+        self.pixels[rect.y:rect.y1, rect.x:rect.x1] = values
+        return self._record_rect(label, rect, before, after=values)
+
+    def write_pixels(self, ys, xs, values, label: str) -> OperationSummary:
+        """Set scattered pixels (absolute coordinates, unique) to exact values."""
+        self._finish_stroke()
+        ys, xs = np.asarray(ys, dtype=np.int64), np.asarray(xs, dtype=np.int64)
+        values = np.asarray(values, dtype=np.uint8).reshape(len(ys), self.channels)
+        before = self.pixels[ys, xs]
+        self.pixels[ys, xs] = values
+        return self._record_sparse(label, ys, xs, before, touched=len(ys))
+
+    def _with_touched(self, summary: OperationSummary, touched: int) -> OperationSummary:
+        summary = OperationSummary(summary.label, summary.changed_pixels, summary.changed_bytes, summary.bbox,
+                                   touched_pixels=touched)
+        self.last_operation = summary
+        return summary
+
     def transform(self, op: str) -> OperationSummary:
         """Lossless rotate/flip of the whole image."""
         self._finish_stroke()
@@ -488,14 +544,15 @@ class Document:
             sl = (slice(command.y0, command.y0 + h), slice(command.x0, command.x0 + w))
             ref = self.reference()[sl]
             self.pixels[sl] = new
-            changed = (old != new).any(axis=2)
-            ys, xs = np.nonzero(changed)
-            bbox = _bbox_of(ys + command.y0, xs + command.x0)
         self._adjust_content_diff(old, new, ref)
+        if isinstance(command, SparsePatch):
+            changed_pixels = int(np.count_nonzero(pixel_changes(old, new)))
+            changed_bytes = int(np.count_nonzero(old != new))
+        else:
+            changed_pixels, changed_bytes, bbox = _rect_changes(old, new, command.x0, command.y0)
         if bbox is not None:
             self._touch(bbox)
-        neq = old != new
-        summary = OperationSummary(f"{verb} {command.label}", int(neq.any(axis=-1).sum()), int(neq.sum()), bbox)
+        summary = OperationSummary(f"{verb} {command.label}", changed_pixels, changed_bytes, bbox)
         self.last_operation = summary
         return summary
 
@@ -544,13 +601,34 @@ class Document:
             return True
 
 
-def _strip_diff(a: np.ndarray, b: np.ndarray, rows: int = 256) -> tuple[int, int]:
+def _strip_diff(a: np.ndarray, b: np.ndarray, rows: int | None = None) -> tuple[int, int]:
+    """diff_counts in strips of about 4M values, so no full-size temporary is allocated."""
+    rows = rows or max(1, (1 << 22) // max(1, a[0].size if len(a) else 1))
     pixels = bytes_ = 0
     for y0 in range(0, a.shape[0], rows):
         p, c = diff_counts(a[y0:y0 + rows], b[y0:y0 + rows])
         pixels += p
         bytes_ += c
     return pixels, bytes_
+
+
+def _rect_changes(a: np.ndarray, b: np.ndarray, x0: int, y0: int) -> tuple[int, int, Rect | None]:
+    """(changed pixels, changed bytes, bounding box) between two equal (h, w, C) regions
+    whose top-left corner is at (x0, y0), computed in strips."""
+    rows = max(1, (1 << 22) // max(1, a[0].size))
+    pixels = bytes_ = 0
+    row_hit = np.zeros(a.shape[0], dtype=bool)
+    col_hit = np.zeros(a.shape[1], dtype=bool)
+    for r0 in range(0, a.shape[0], rows):
+        bytes_ += int(np.count_nonzero(a[r0:r0 + rows] != b[r0:r0 + rows]))
+        changed = pixel_changes(a[r0:r0 + rows], b[r0:r0 + rows])
+        pixels += int(np.count_nonzero(changed))
+        row_hit[r0:r0 + rows] = changed.any(axis=1)
+        col_hit |= changed.any(axis=0)
+    if not pixels:
+        return 0, 0, None
+    ys, xs = np.flatnonzero(row_hit), np.flatnonzero(col_hit)
+    return pixels, bytes_, Rect.from_points(int(xs[0]) + x0, int(ys[0]) + y0, int(xs[-1]) + x0, int(ys[-1]) + y0)
 
 
 __all__ = [

@@ -13,10 +13,11 @@ from collections import OrderedDict
 
 import numpy as np
 from PyQt6.QtCore import QLineF, QPointF, QRectF, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QCursor, QImage, QPainter, QPen
+from PyQt6.QtGui import QColor, QCursor, QFontMetricsF, QImage, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import QAbstractScrollArea
 
 from ..core.document import Clip, Document, Rect
+from ..core.pixels import pixel_changes
 from . import display, style
 
 ZOOM_LEVELS = [0.125, 0.25, 0.5, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32]
@@ -38,6 +39,7 @@ class DocumentSource:
         self.compare = "current"  # "current" | "original" | "split"
         self.split = 0.5  # fraction of the width shown as original in split mode
         self.highlight_changes = False
+        self.pending = None  # a power-tool result drawn over the buffer (display only)
 
     @property
     def width(self) -> int:
@@ -64,6 +66,10 @@ class DocumentSource:
     def render(self, x0: int, y0: int, x1: int, y1: int, step: int, zoom: float) -> np.ndarray:
         doc = self.doc
         cur = doc.pixels[y0:y1:step, x0:x1:step]
+        p = self.pending
+        if p is not None and p.rect.x < x1 and x0 < p.rect.x1 and p.rect.y < y1 and y0 < p.rect.y1:
+            cur = cur.copy()  # the preview is painted into a throwaway copy, never the buffer
+            p.overlay(cur, x0, y0, step)
         need_ref = self.compare != "current" or self.highlight_changes
         ref = doc.reference()[y0:y1:step, x0:x1:step] if need_ref else None
         if ref is not None and ref.shape != cur.shape:
@@ -78,7 +84,7 @@ class DocumentSource:
             base = cur
         rgb = display.to_display_rgb(base, doc.mode, self.display_mode, x0, y0, step, zoom)
         if self.highlight_changes:
-            display.tint_changed(rgb, (cur != ref).any(axis=2))
+            display.tint_changed(rgb, pixel_changes(cur, ref))
         return rgb
 
 
@@ -216,6 +222,16 @@ class PixelView(QAbstractScrollArea):
     def raw_pixel_at(self, pos: QPointF) -> tuple[int, int]:
         fx, fy = self.view_to_image(pos)
         return math.floor(fx), math.floor(fy)
+
+    def visible_image_rect(self) -> Rect | None:
+        """The part of the image currently on screen."""
+        if self.source is None:
+            return None
+        x0, y0 = self.view_to_image(QPointF(0, 0))
+        x1, y1 = self.view_to_image(QPointF(self.viewport().width(), self.viewport().height()))
+        left, top = math.floor(x0), math.floor(y0)
+        r = Rect(left, top, math.ceil(x1) - left, math.ceil(y1) - top).clamp(*self.image_size())
+        return None if r.empty else r
 
     def image_rect_to_view(self, rect: Rect) -> QRectF:
         tl = self.image_to_view(rect.x, rect.y)
@@ -459,8 +475,12 @@ class EditorCanvas(PixelView):
     selectionChanged = pyqtSignal(object)  # Rect | None
     pasteCommitted = pyqtSignal(int, int)
     pasteCancelled = pyqtSignal()
+    bucketClicked = pyqtSignal(int, int)
+    shapeDrawn = pyqtSignal(int, int, int, int)  # anchor and end pixel, already constrained
+    pendingApplyRequested = pyqtSignal()
+    pendingDiscardRequested = pyqtSignal()
 
-    TOOLS = ("inspect", "pencil", "eyedropper", "select", "hand", "zoom")
+    TOOLS = ("inspect", "pencil", "eyedropper", "select", "hand", "zoom", "bucket", "shape")
 
     def __init__(self, tool_settings, parent=None):
         super().__init__(parent)
@@ -475,6 +495,9 @@ class EditorCanvas(PixelView):
         self._paste_preview_data = None
         self._select_anchor: tuple[int, int] | None = None
         self._stroking = False
+        self._shape_drag: list[int] | None = None  # [ax, ay, bx, by] while dragging a shape
+        self.pending = None
+        self.show_pending = True
         self.busy = False
 
     def set_document(self, doc: Document | None) -> None:
@@ -485,6 +508,8 @@ class EditorCanvas(PixelView):
         self.doc = doc
         self.selection = None
         self.inspected = None
+        self.pending = None
+        self._shape_drag = None
         self.cancel_paste()
         old = self.doc_source
         self.doc_source = DocumentSource(doc) if doc else None
@@ -505,6 +530,8 @@ class EditorCanvas(PixelView):
             "select": Qt.CursorShape.CrossCursor,
             "hand": Qt.CursorShape.OpenHandCursor,
             "zoom": Qt.CursorShape.SizeAllCursor,
+            "bucket": Qt.CursorShape.PointingHandCursor,
+            "shape": Qt.CursorShape.CrossCursor,
         }
         if self.doc is None:
             self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
@@ -519,6 +546,35 @@ class EditorCanvas(PixelView):
     def set_inspected(self, pixel: tuple[int, int] | None) -> None:
         self.inspected = pixel
         self.viewport().update()
+
+    def set_pending(self, pending, *, visible: bool | None = None) -> None:
+        """Show (or clear) a power-tool preview. Only tiles under the old and new preview are
+        re-rendered; the buffer is never written."""
+        old = self.pending if self.show_pending else None
+        self.pending = pending
+        if visible is not None:
+            self.show_pending = visible
+        if self.doc_source is not None:
+            self.doc_source.pending = pending if self.show_pending else None
+        for p in (old, self.doc_source.pending if self.doc_source else None):
+            if p is not None:
+                self.tiles.invalidate(p.rect)
+        self.viewport().update()
+
+    def pending_visible(self) -> bool:
+        return self.pending is not None and self.show_pending
+
+    @staticmethod
+    def constrain(kind: str, ax: int, ay: int, bx: int, by: int) -> tuple[int, int]:
+        """Shift: square or circle, or a line snapped to 0°, 45° or 90°."""
+        dx, dy = bx - ax, by - ay
+        if kind == "line":
+            if abs(dx) > 2 * abs(dy):
+                return bx, ay
+            if abs(dy) > 2 * abs(dx):
+                return ax, by
+        side = max(abs(dx), abs(dy))
+        return ax + (side if dx >= 0 else -side), ay + (side if dy >= 0 else -side)
 
 
     def begin_paste(self, clip: Clip) -> None:
@@ -549,6 +605,16 @@ class EditorCanvas(PixelView):
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_Escape and self.paste_clip is not None:
             self.cancel_paste()
+            return
+        if event.key() == Qt.Key.Key_Escape and self._shape_drag is not None:
+            self._shape_drag = None
+            self.viewport().update()
+            return
+        if self.pending is not None and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.pendingApplyRequested.emit()
+            return
+        if self.pending is not None and event.key() == Qt.Key.Key_Escape:
+            self.pendingDiscardRequested.emit()
             return
         super().keyPressEvent(event)
 
@@ -589,6 +655,12 @@ class EditorCanvas(PixelView):
         elif self.tool == "select":
             self._select_anchor = self.pixel_at(event.position(), clamp=True)
             self.set_selection(Rect(*self._select_anchor, 1, 1))
+        elif self.tool == "bucket" and pixel:
+            self.bucketClicked.emit(*pixel)
+        elif self.tool == "shape":
+            x, y = self.raw_pixel_at(event.position())
+            self._shape_drag = [x, y, x, y]
+            self.viewport().update()
         elif self.tool == "inspect" and pixel:
             self.pixelPicked.emit(*pixel)
 
@@ -606,6 +678,14 @@ class EditorCanvas(PixelView):
             return
         if self._stroking:
             self.update_image_rect(self.doc.stroke_to(*self.raw_pixel_at(event.position())))
+        elif self._shape_drag is not None:
+            x, y = self.raw_pixel_at(event.position())
+            ax, ay = self._shape_drag[:2]
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                x, y = self.constrain(self.tool_settings.shape, ax, ay, x, y)
+            old = self._shape_view_rect()
+            self._shape_drag[2:] = [x, y]
+            self.viewport().update(old.united(self._shape_view_rect()))
         elif self._select_anchor is not None:
             x, y = self.pixel_at(event.position(), clamp=True)
             self.selection = Rect.from_points(*self._select_anchor, x, y)
@@ -629,6 +709,142 @@ class EditorCanvas(PixelView):
         elif self._select_anchor is not None and event.button() == Qt.MouseButton.LeftButton:
             self._select_anchor = None
             self.selectionChanged.emit(self.selection)
+        elif self._shape_drag is not None and event.button() == Qt.MouseButton.LeftButton:
+            drag, self._shape_drag = self._shape_drag, None
+            self.viewport().update()
+            self.shapeDrawn.emit(*drag)
+
+    def _shape_view_rect(self):
+        """Viewport area covered by the shape being dragged (for partial repaints)."""
+        ax, ay, bx, by = self._shape_drag
+        grow = self.tool_settings.stroke
+        r = self.image_rect_to_view(Rect.from_points(ax, ay, bx, by))
+        pad = grow * self.zoom + 40  # stroke, plus the size label
+        return r.adjusted(-pad, -pad, pad, pad).toAlignedRect()
+
+    def _paint_shape_drag(self, painter: QPainter) -> None:
+        """Vector preview while dragging; on release the exact raster becomes the pending preview."""
+        t = style.tokens()
+        ax, ay, bx, by = self._shape_drag
+        ts = self.tool_settings
+        r, g, b = ts.color[:3]
+        z = self.zoom
+        pen = QPen(QColor(r, g, b, 220))
+        pen.setWidthF(max(1.0, ts.stroke * z))
+        pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
+        pen.setCapStyle(Qt.PenCapStyle.SquareCap)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        box = self.image_rect_to_view(Rect.from_points(ax, ay, bx, by))
+        if ts.shape == "line":
+            painter.setPen(pen)
+            painter.drawLine(self.image_to_view(ax + 0.5, ay + 0.5), self.image_to_view(bx + 0.5, by + 0.5))
+        else:
+            inset = pen.widthF() / 2
+            inner = box.adjusted(inset, inset, -inset, -inset)
+            if ts.filled:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(r, g, b, 220))
+                inner = box
+            else:
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+            (painter.drawEllipse if ts.shape == "ellipse" else painter.drawRect)(inner)
+        guide = QPen(QColor(t["warning"]))
+        guide.setCosmetic(True)
+        guide.setStyle(Qt.PenStyle.DotLine)
+        painter.setPen(guide)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(box)
+        w, h = abs(bx - ax) + 1, abs(by - ay) + 1
+        self._paint_tag(painter, box.bottomRight() + QPointF(8, 8), f"{w} × {h}", "raised", "text")
+        painter.restore()
+
+    def _paint_preview_tab(self, painter: QPainter) -> None:
+        """A tab on the preview's outline: what it is, then the two keys that resolve it.
+
+        It sits flush on the outline's top edge so it reads as that rectangle's label, and
+        detaches (rounded all round) when the outline is scrolled out of view.
+        """
+        p, t = self.pending, style.tokens()
+        if not self.show_pending:
+            title = "Preview hidden"
+        elif getattr(p, "partial", False):
+            title = "Preview of the visible part"
+        else:
+            title = "Preview"
+        keys = (("Enter", getattr(p, "verb", "Apply")), ("Esc", "Discard"))
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        title_font = style.ui_font(0.9, style.QFont.Weight.DemiBold)
+        text_font = style.ui_font(0.9)
+        key_font = style.ui_font(0.78, style.QFont.Weight.DemiBold)
+        tm, xm, km = (QFontMetricsF(f) for f in (title_font, text_font, key_font))
+        pad, gap, cap_pad = 9.0, 14.0, 5.0
+        height = max(tm.height(), km.height() + 6) + 8
+        widths = [km.horizontalAdvance(k) + 2 * cap_pad + 5 + xm.horizontalAdvance(v) for k, v in keys]
+        width = pad + tm.horizontalAdvance(title) + sum(gap + w for w in widths) + pad
+        outline = self.image_rect_to_view(p.rect)
+        tab = QRectF(outline.left(), outline.top() - height, width, height)
+        vp = QRectF(self.viewport().rect()).adjusted(4, 4, -4, -4)
+        attached = vp.contains(tab.topLeft()) and tab.right() <= vp.right()
+        if not attached:
+            tab.moveLeft(min(max(tab.left(), vp.left()), vp.right() - width))
+            tab.moveTop(min(max(tab.top(), vp.top()), vp.bottom() - height))
+        radius = 5.0
+        path = QPainterPath()
+        if attached:  # rounded on top only, square where it meets the outline
+            path.moveTo(tab.bottomLeft())
+            path.lineTo(tab.left(), tab.top() + radius)
+            path.quadTo(tab.topLeft(), QPointF(tab.left() + radius, tab.top()))
+            path.lineTo(tab.right() - radius, tab.top())
+            path.quadTo(tab.topRight(), QPointF(tab.right(), tab.top() + radius))
+            path.lineTo(tab.bottomRight())
+            path.closeSubpath()
+        else:
+            path.addRoundedRect(tab, radius, radius)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(t["warning"]))
+        painter.drawPath(path)
+        ink = QColor(t["base"])
+        x, mid = tab.left() + pad, tab.center().y()
+        painter.setPen(ink)
+        painter.setFont(title_font)
+        painter.drawText(QPointF(x, mid + (tm.ascent() - tm.descent()) / 2), title)
+        x += tm.horizontalAdvance(title)
+        for (key, verb), w in zip(keys, widths):
+            x += gap
+            cap = QRectF(x, mid - (km.height() + 4) / 2, km.horizontalAdvance(key) + 2 * cap_pad, km.height() + 4)
+            edge = QColor(ink)
+            edge.setAlpha(150)
+            painter.setPen(QPen(edge, 1))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(cap.adjusted(0.5, 0.5, -0.5, -0.5), 3, 3)
+            painter.setPen(ink)
+            painter.setFont(key_font)
+            painter.drawText(cap, Qt.AlignmentFlag.AlignCenter, key)
+            painter.setFont(text_font)
+            painter.drawText(QPointF(cap.right() + 5, mid + (xm.ascent() - xm.descent()) / 2), verb)
+            x += w
+        painter.restore()
+
+    def _paint_tag(self, painter: QPainter, at: QPointF, text: str, bg: str, fg: str) -> None:
+        t = style.tokens()
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        font = style.ui_font(0.85, style.QFont.Weight.DemiBold)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        rect = QRectF(at.x(), at.y(), metrics.horizontalAdvance(text) + 14, metrics.height() + 6)
+        vp = QRectF(self.viewport().rect()).adjusted(4, 4, -4, -4)
+        rect.moveLeft(min(max(rect.left(), vp.left()), vp.right() - rect.width()))
+        rect.moveTop(min(max(rect.top(), vp.top()), vp.bottom() - rect.height()))
+        painter.setPen(QColor(t["border_strong"]) if bg == "raised" else Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(t[bg]))
+        painter.drawRoundedRect(rect, rect.height() / 2, rect.height() / 2)
+        painter.setPen(QColor(t[fg]))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+        painter.restore()
 
 
     def paint_empty(self, painter: QPainter) -> None:
@@ -674,6 +890,11 @@ class EditorCanvas(PixelView):
             painter.drawLine(top, self.image_to_view(src.split_x, self.doc.height))
         if self.selection is not None:
             self._outline(painter, self.selection, QColor(255, 255, 255), dashed=True)
+        if self.pending is not None:
+            self._outline(painter, self.pending.rect, QColor(t["warning"]), dashed=True)
+            self._paint_preview_tab(painter)
+        if self._shape_drag is not None:
+            self._paint_shape_drag(painter)
         if self.inspected is not None:
             x, y = self.inspected
             r = self.image_rect_to_view(Rect(x, y, 1, 1))

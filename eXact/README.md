@@ -76,7 +76,7 @@ can resize, close, float or rearrange.
 
 | Area | What it holds |
 |---|---|
-| **Toolbar** (top) | Open, Save, Undo/Redo (tooltips name the step), zoom out / level / in, fit, 100%, pixel grid, highlight changes, display mode, Current / Original / Split view with the split slider, Compare, and the **Edit / Inspect** workspace switch. |
+| **Toolbar** (top) | Open, Save, Undo/Redo (tooltips name the step), zoom out / level / in, fit, 100%, pixel grid, highlight changes, display mode, Current / Original / Split view with the split slider, Compare, the hazard-taped **Power Tools** section, and the **Edit / Inspect** workspace switch. |
 | **Tool palette** (left) | Inspect, Pencil, Eyedropper, Rectangle Select, Hand and Zoom tools; rotate and flip; a chip showing the pencil colour. |
 | **Canvas** (centre) | Nearest-neighbour view from 12.5% to 3200%, optional pixel grid at 400% and above, empty state with drag-and-drop. |
 | **Tool** (right) | Properties of the active tool. Pencil: exact RGBA values (swatch, `RRGGBBAA`, a slider and number per channel) each with its own **write** toggle, and size. Select: the selection as editable x, y, w, h, plus copy, paste, fill and select-all. |
@@ -125,6 +125,9 @@ On macOS, *Ctrl* below means *⌘*. Help > Keyboard Shortcuts (F1) lists them in
 | Rotate 90° CW / CCW | Ctrl + `R` / Ctrl + Shift + `R` (180° and flips are in the **Image** menu and the tool palette) |
 | Undo / Redo | Ctrl + `Z` / Ctrl + Shift + `Z` |
 | Compare two PNGs | Ctrl + Shift + `D` |
+| Paint Bucket / Shapes (power tools) | `G` / `U` |
+| Apply / discard a power-tool preview | `Enter` / `Esc` (on the canvas) |
+| Constrain a shape to a square, circle or 45° line | Shift + drag |
 
 **Pencil.** Set the colour in the Tool panel with exact `RRGGBBAA` hex values, the per-channel
 sliders and numbers, the colour dialog, the Eyedropper, Alt+click, or *Use as colour* in the
@@ -144,6 +147,46 @@ is deliberately not the system clipboard, because other applications may convert
 
 **Rotations and flips** show a one-time notice. The transform preserves every value, but
 pixel-order payloads will not decode until you apply the inverse.
+
+### Power Tools
+
+Everything above writes values you chose. **Power Tools** compute values instead, which is
+exactly what eXact otherwise exists to prevent, so they are fenced off: a hazard-taped
+section of the toolbar and a **Power Tools** menu of their own.
+
+| Tool | What it does |
+|---|---|
+| **Paint Bucket** (`G`) | Fills with the pencil colour. A pixel matches when *every* channel, alpha included, is within ±tolerance (0–255) of the clicked pixel. Contiguous (4-connected) or global. |
+| **Shapes** (`U`) | Line, rectangle or ellipse in the pencil colour; outline width 1–64 px (outlines grow inward) or filled. Aliased: every pixel is either written exactly or left alone. A line is the pencil's own Bresenham stroke. |
+| **Gaussian Blur** | Radius 0.10–100 px in 0.01 px steps and strength 0–100 % in 0.1 % steps. Below 2 px an exact sampled kernel, above it three box passes (as in the SVG/CSS filter specifications). Integer arithmetic throughout, so the same settings give the same bytes on every machine. Reads neighbours beyond a selection; image edges are extended. |
+| **Invert Colours** | 255 − v in each ticked channel. Its own inverse. |
+| **Photo Nuker** | Deep-fries: saturation, contrast, posterisation, 4–16 px chroma blocks, grain and a warm tint, all scaled by *heat* (0–100 %). Never touches alpha. |
+| **Cosmic Ray** | Flips N distinct random bits (seeded, reproducible) in the ticked channels. Useful for proving that an ImageStore checksum notices. |
+
+Every destructive power tool has the same three controls:
+
+- **Preview** computes the result into a separate array and draws it over the canvas. The
+  buffer is not touched, so the integrity chips do not move, and only tiles under the
+  preview are re-rendered. The toggle switches between the result and the untouched
+  buffer. Bucket and shape previews follow the Tool panel: change the tolerance, stroke or
+  colour and the same click or drag is recomputed.
+- **Apply** (or Enter on the canvas) writes the result as one undoable step with exact
+  accounting. Apply reuses the preview rather than computing it again. A preview computed
+  from pixels that have since changed is discarded, never applied.
+- **Undo** takes back the last power-tool step from the same panel or dialog.
+
+The filters open in a modeless dialog, so you can still pan and zoom the canvas. It has a
+300 % before/after magnifier that follows the pixel you inspect, the target (the selection,
+or the whole image), per-channel toggles (prefilled from the pencil's write mask), and a
+plain statement of how many pixels may change. A selection limits where every power tool
+writes. Targets up to 2 MP re-preview live as you move a slider; larger ones preview on
+demand behind the progress dialog.
+
+**Memory.** The tools work in row bands and column strips of a few megabytes and never make
+a float copy of the image. A whole-image filter allocates its result once, and that array
+then becomes the redo half of the history step. Undo steps store whichever is smaller:
+the coordinates of the painted pixels (thin shapes, sparse bit flips) or a copy of the
+bounding box (dense fills, filters).
 
 ### Pixel-difference viewer
 
@@ -328,8 +371,8 @@ alpha=0 pixels with non-zero RGB, and so on.
 ## Tests
 
 ```bash
-python -m pytest            # 87 tests, about 30 s (GUI tests run headless with QT_QPA_PLATFORM=offscreen)
-python -m pytest --runslow  # adds 7488×7487 full-size tests (90 total)
+python -m pytest            # 115 tests, about 45–60 s (GUI tests run headless with QT_QPA_PLATFORM=offscreen)
+python -m pytest --runslow  # adds 7488×7487 full-size tests (118 total)
 ```
 
 The tests cover:
@@ -368,6 +411,14 @@ The tests cover:
   hashing during a brush stroke; tile eviction never losing unsaved edits; compare dialog;
   error explanations; cancellable open (state unchanged) while save and transforms are never
   cancellable; a 3000×2000 navigation test and a 7488×7487 one under `--runslow`
+- power tools (`tests/test_power.py`): the blur against a float64 Gaussian, banding that
+  never changes the result, a blurred selection equal to the same area of a whole-image
+  blur, no overflow at the largest radius; outlines thin, closed and inside the fill; a
+  line identical to a pencil stroke; flood fill against brute force; invert twice is
+  identity; nuker crops equal to the full result and alpha untouched; exactly N bits
+  flipped; counters checked against full rescans across apply, undo and redo; and in the
+  window, every tool's Preview leaves the buffer and generation untouched, Apply reuses
+  the preview, Undo restores every byte, and a stale preview is never applied
 - the **final acceptance test**
 
 **Final acceptance test** (`tests/test_acceptance.py`):
@@ -456,6 +507,30 @@ two runs):
 
 `python scripts/benchmark.py --size 1024x1024` runs the same scenarios on a small image.
 
+### Power Tools (macOS)
+
+7488×7487 RGBA payload image, same MacBook as above, each scenario in a fresh process. The
+CPU sat at 99–101 °C throughout (heavily throttled), so treat these as single runs on a
+hot machine rather than best cases. Image plus immutable original is 458 MB of the RSS.
+
+| Operation (whole image unless noted) | Time | Peak RSS |
+|---|---|---|
+| Gaussian blur, 1.5 px (exact kernel) | 8.6 s | 740 MB |
+| Gaussian blur, 3 px (box passes), 1 thread → 4 threads | 23.7 s → 14.2 s | 919 → 924 MB |
+| Gaussian blur, 100 px | 20.0 s | 752 MB |
+| Apply / undo a whole-image result (exact accounting) | 1.0–1.2 s / 0.6–0.7 s (were 6.6 s / 7.2 s before banded `uint32` change detection) | – |
+| Photo Nuker, 70 %, 1 → 4 threads | 9.7 s → 8.6 s | 690–738 MB |
+| Invert RGB (+ apply 0.64 s, undo 0.50 s) | 0.43 s | 894 MB with history |
+| Cosmic ray, 1,000,000 bits | 0.88 s | 575 MB |
+| Paint bucket, contiguous, 15,000,000-pixel region (+ apply 0.32 s) | 1.22 s | 654 MB |
+| Paint bucket, global | 2.18 s | 514 MB |
+| Ellipse outline, 7201 px across, 8 px stroke (221,740 pixels; + apply 0.28 s, 5 MB of history) | 0.04 s | 80 MB process total (on a 1 MP image) |
+| Canvas, 1184×784 at 100 %: first paint with a preview / cached / after discard | 40–46 ms / 3–4 ms / 33–42 ms | – |
+
+Whole-image filters on images this size run behind the progress dialog. Zoomed in, the
+preview covers only the visible part of the target and stays live while you drag sliders;
+Apply then computes the whole target.
+
 **Expected memory:** the buffer (224 MB) plus the immutable original (224 MB) plus about
 60 MB of runtime. Rotation briefly needs a second buffer, and save verification needs
 the decoder's copy. The hex view, inspector and integrity panels read the buffer in place
@@ -474,9 +549,11 @@ These are not implemented in v0.1.0:
   other formats are refused with an explanation.
 - **APNG:** only the default image is edited; animation frames are dropped on save after
   confirmation.
-- **Annotation tools:** there are no line, shape or text tools. You can draw with the
-  pencil (with a channel mask), fill a rectangle, paste, and set exact values for one
-  pixel.
+- **Annotation tools:** there is no text tool, and shapes are aliased only (no
+  anti-aliasing, by design). Shapes cannot be edited after you apply them.
+- **Power-tool previews below 100% zoom** show sampled pixels like the rest of the canvas,
+  so scattered Cosmic Ray flips may not be visible until you zoom in (the dialog's
+  magnifier always shows them).
 - **Selections:** a selection cannot be moved by dragging (paste is placed by click or by
   coordinates). There is no crop or resize, since those change dimensions.
 - **System clipboard:** eXact uses an internal clipboard only, by design.
@@ -516,6 +593,7 @@ eXact/
 │   │   ├── history.py        # patch-based undo/redo
 │   │   ├── document.py       # the editable document, dirty tracking
 │   │   ├── diff.py           # raw buffer / file comparison
+│   │   ├── power.py          # power tools: bucket, shapes, blur, invert, nuker, cosmic ray
 │   │   └── synthetic.py      # deterministic payload-like test images
 │   └── gui/                  # PyQt6
 │       ├── app.py            # entry point, theme
@@ -523,6 +601,7 @@ eXact/
 │       ├── canvas.py         # tiled zoom/pan view, tools, tile cache
 │       ├── display.py        # display-only conversions (composite, channels, heatmap)
 │       ├── panels.py         # tool properties, pixel inspector, integrity, history, info
+│       ├── power_tools.py    # Power Tools section, previews, filter dialog
 │       ├── hexview.py        # virtual hex view of the canonical buffer
 │       ├── diff_dialog.py    # pixel-difference viewer
 │       ├── errors.py         # plain-language error explanations

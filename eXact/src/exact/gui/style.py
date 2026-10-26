@@ -317,6 +317,22 @@ QFrame[role="segmented"] QToolButton:checked {{ background: {t['raised']}; color
     border-color: {t['border_strong']}; }}
 QFrame[role="segmented"] QToolButton:focus {{ border-color: {t['accent']}; }}
 
+QFrame[role="power"] {{ background: {t['input']}; border: 1px solid {t['warning_subtle']}; border-radius: 7px; }}
+QFrame[role="power"] QToolButton {{ border-radius: 5px; padding: 3px; }}
+QFrame[role="power"] QToolButton[popupMode="1"] {{ padding-right: 13px; }}
+QFrame[role="power"] QToolButton::menu-button {{ border: none; background: transparent; width: 12px; }}
+QFrame[role="power"] QToolButton:checked {{ background: {t['warning_subtle']}; border-color: {t['warning_subtle']};
+    color: {t['warning']}; }}
+QFrame[role="power"] QToolButton:focus {{ border-color: {t['warning']}; }}
+QPushButton[variant="power"] {{ background: {t['warning']}; color: {t['base']}; border-color: {t['warning']};
+    font-weight: 600; }}
+QPushButton[variant="power"]:hover {{ background: {t['warning_subtle']}; color: {t['warning']}; }}
+QPushButton[variant="power"]:focus {{ border-color: {t['text']}; }}
+QPushButton[variant="power"]:disabled {{ background: {t['hover']}; border-color: {t['hover']};
+    color: {t['text_disabled']}; }}
+QPushButton[variant="toggle"]:checked {{ background: {t['accent_subtle']}; border-color: {t['accent']};
+    color: {t['text']}; }}
+
 QFrame[role="card"] {{ background: {t['raised']}; border: 1px solid {t['border']}; border-radius: 8px; }}
 QFrame[role="card"] QLabel {{ background: transparent; }}
 QFrame[role="divider"] {{ background: {t['border']}; max-height: 1px; min-height: 1px; border: none; }}
@@ -445,6 +461,26 @@ ICONS: dict[str, str] = {
                   '<path d="M5 21v-4.5h4.5"/>',
     "flip-h": '<path d="M12 3v18" stroke-dasharray="2 2.2"/><path d="M8.5 7 3.5 17h5z"/><path d="m15.5 7 5 10h-5z"/>',
     "flip-v": '<path d="M3 12h18" stroke-dasharray="2 2.2"/><path d="M7 8.5 17 3.5v5z"/><path d="m7 15.5 10 5v-5z"/>',
+    # power tools
+    "bolt": '<path d="M13 2.5 5 13.5h6l-1 8 8-11h-6z"/>',
+    "bucket": '<path d="M4.6 11.4 11 5l7 7-6.4 6.4a1.6 1.6 0 0 1-2.2 0l-4.8-4.8a1.6 1.6 0 0 1 0-2.2z"/>'
+              '<path d="M4.5 12.5h13.5"/><path d="M8.5 3 11 5.5"/>'
+              '<path d="M20 15s1.6 2.1 1.6 3.1a1.6 1.6 0 0 1-3.2 0c0-1 1.6-3.1 1.6-3.1z" fill="{c}" stroke="none"/>',
+    "shapes": '<rect x="3.5" y="10.5" width="9" height="9" rx=".5"/><circle cx="15.5" cy="8.5" r="5"/>',
+    "shape-line": '<path d="M5.5 18.5 18.5 5.5"/><circle cx="5.5" cy="18.5" r="1.8" fill="{c}" stroke="none"/>'
+                  '<circle cx="18.5" cy="5.5" r="1.8" fill="{c}" stroke="none"/>',
+    "shape-rect": '<rect x="4" y="6" width="16" height="12" rx=".5"/>',
+    "shape-ellipse": '<ellipse cx="12" cy="12" rx="8.5" ry="6.5"/>',
+    "blur": '<circle cx="12" cy="12" r="2.4" fill="{c}" stroke="none"/><circle cx="12" cy="12" r="5.6" stroke-opacity=".65"/>'
+            '<circle cx="12" cy="12" r="8.9" stroke-opacity=".35" stroke-dasharray="1.6 2.3"/>',
+    "invert": '<circle cx="12" cy="12" r="8.5"/><path d="M12 3.5a8.5 8.5 0 0 1 0 17z" fill="{c}" stroke="none"/>',
+    "nuke": '<path d="M13.70 9.06L16.50 4.21A9 9 0 0 0 7.50 4.21L10.30 9.06A3.4 3.4 0 0 1 13.70 9.06zM8.60 12.00L3.00 12.00'
+            'A9 9 0 0 0 7.50 19.79L10.30 14.94A3.4 3.4 0 0 1 8.60 12.00zM13.70 14.94L16.50 19.79A9 9 0 0 0 21.00 12.00'
+            'L15.40 12.00A3.4 3.4 0 0 1 13.70 14.94z" fill="{c}" stroke="none"/><circle cx="12" cy="12" r="1.6" fill="{c}"'
+            ' stroke="none"/>',
+    "cosmic": '<path d="M3.5 3.5 12.5 12.5"/><path d="M3.5 9 8.5 14" stroke-opacity=".45"/>'
+              '<path d="M9 3.5 14 8.5" stroke-opacity=".45"/><rect x="13.5" y="13.5" width="7" height="7" rx="1"/>'
+              '<path d="M16.2 15.8 17.3 15v4"/>',
     # status
     "check": '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
     "check-circle": '<circle cx="12" cy="12" r="9"/><path d="m8 12.5 2.8 2.8L16 10"/>',
@@ -515,10 +551,11 @@ class _SvgIconEngine(QIconEngine):
     """Renders an icon from SVG at whatever size and device pixel ratio Qt asks for, in the
     active theme's colours (so icons follow theme changes and stay crisp on HiDPI)."""
 
-    def __init__(self, name: str, tone: str | None = None):
+    def __init__(self, name: str, tone: str | None = None, on_tone: str = "accent"):
         super().__init__()
         self.name = name
         self.tone = tone
+        self.on_tone = on_tone
 
     def _color(self, mode: QIcon.Mode, state: QIcon.State) -> str:
         if self.tone:
@@ -526,7 +563,7 @@ class _SvgIconEngine(QIconEngine):
         if mode == QIcon.Mode.Disabled:
             return _tokens["text_disabled"]
         if state == QIcon.State.On:
-            return _tokens["accent"]
+            return _tokens[self.on_tone]
         if mode in (QIcon.Mode.Active, QIcon.Mode.Selected):
             return _tokens["text"]
         return _tokens["icon"]
@@ -543,14 +580,15 @@ class _SvgIconEngine(QIconEngine):
         return QPixmap(_render_icon(self.name, self._color(mode, state), size.width(), size.height(), float(scale)))
 
     def clone(self) -> "QIconEngine":
-        return _SvgIconEngine(self.name, self.tone)
+        return _SvgIconEngine(self.name, self.tone, self.on_tone)
 
 
-def icon(name: str, tone: str | None = None) -> QIcon:
-    """Theme-coloured icon. *tone* pins a token colour (e.g. "success") for status icons."""
+def icon(name: str, tone: str | None = None, on_tone: str = "accent") -> QIcon:
+    """Theme-coloured icon. *tone* pins a token colour (e.g. "success") for status icons;
+    *on_tone* colours the checked state (power tools use "warning")."""
     if name not in ICONS and name not in _FILLED_LOGOS:
         raise KeyError(f"unknown icon {name!r}")
-    return QIcon(_SvgIconEngine(name, tone))
+    return QIcon(_SvgIconEngine(name, tone, on_tone))
 
 
 def app_icon(name: str) -> QIcon:

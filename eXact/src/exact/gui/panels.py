@@ -124,6 +124,11 @@ class ToolSettings:
     color: tuple[int, int, int, int] = (255, 0, 0, 255)
     size: int = 1
     mask: list[bool] = field(default_factory=lambda: [True, True, True, True])
+    tolerance: int = 0
+    contiguous: bool = True
+    shape: str = "rect"
+    stroke: int = 1
+    filled: bool = False
 
 
 TOOL_INFO = {
@@ -138,7 +143,99 @@ TOOL_INFO = {
     "hand": ("Hand", "hand", "Drag to pan. Space+drag or middle-drag pans with any tool."),
     "zoom": ("Zoom", "zoom", "Click to zoom in, Alt+click to zoom out. Ctrl+scroll zooms anywhere; "
              "Ctrl+0 is 100%, Ctrl+9 fits the window."),
+    "bucket": ("Paint Bucket", "bucket", "Power tool. Click to preview a fill with the pencil colour; Enter applies, "
+               "Esc discards. A selection limits where it may spill."),
+    "shape": ("Shapes", "shapes", "Power tool. Drag to preview a line, rectangle or ellipse in the pencil colour; "
+              "Shift constrains. Enter applies, Esc discards."),
 }
+PAINT_TOOLS = ("pencil", "bucket", "shape")
+SHAPE_CHOICES = (("line", "Line", "shape-line"), ("rect", "Rectangle", "shape-rect"),
+                 ("ellipse", "Ellipse", "shape-ellipse"))
+
+
+def labelled_slider(lo: int, hi: int, value: int, name: str, suffix: str = "") -> tuple[QHBoxLayout, QSlider, QSpinBox]:
+    """A slider and a spin box kept in step (coarse drag, exact typing)."""
+    row = QHBoxLayout()
+    slider = QSlider(Qt.Orientation.Horizontal)
+    slider.setRange(lo, hi)
+    spin = QSpinBox()
+    spin.setRange(lo, hi)
+    spin.setSuffix(suffix)
+    spin.setFont(style.mono_font())
+    spin.setAccessibleName(name)
+    slider.setAccessibleName(name)
+    slider.valueChanged.connect(spin.setValue)
+    spin.valueChanged.connect(slider.setValue)
+    spin.setValue(value)
+    row.addWidget(slider, 1)
+    row.addWidget(spin)
+    return row, slider, spin
+
+
+class PowerActions(QWidget):
+    """Preview, Apply and Undo for a destructive power tool.
+
+    Preview shows the computed result on the canvas without touching the buffer; Apply
+    writes it as one undoable step; Undo takes back the last power-tool step.
+    """
+
+    previewToggled = pyqtSignal(bool)
+    applyRequested = pyqtSignal()
+    undoRequested = pyqtSignal()
+    discardRequested = pyqtSignal()
+
+    def __init__(self, apply_text: str = "Apply", *, discard: bool = False, stacked: bool = False, parent=None):
+        """stacked=True puts Preview and Apply on their own full-width row (narrow docks)."""
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(6)
+        main = QHBoxLayout()
+        main.setSpacing(6)
+        lay = QHBoxLayout() if stacked else main
+        lay.setSpacing(4 if stacked else 6)
+        outer.addLayout(main)
+        if stacked:
+            outer.addLayout(lay)
+        self.row = main
+        self.undo_button = QPushButton(style.icon("undo"), "Undo")
+        self.undo_button.setProperty("variant", "flat")
+        self.undo_button.setToolTip("Undo the last power-tool step")
+        self.undo_button.clicked.connect(self.undoRequested)
+        lay.addWidget(self.undo_button)
+        self.discard_button = None
+        if discard:
+            self.discard_button = QPushButton("Discard")
+            self.discard_button.setProperty("variant", "flat")
+            self.discard_button.setToolTip("Throw the preview away (Esc). The buffer was never touched.")
+            self.discard_button.clicked.connect(self.discardRequested)
+            lay.addWidget(self.discard_button)
+        lay.addStretch(1)
+        if not stacked:
+            main.addStretch(0)
+        self.preview_button = QPushButton(style.icon("eye"), "Preview")
+        self.preview_button.setCheckable(True)
+        self.preview_button.setProperty("variant", "toggle")
+        self.preview_button.setToolTip("Show the result on the canvas. Display only: the buffer is not touched.")
+        self.preview_button.toggled.connect(self.previewToggled)
+        self.apply_button = QPushButton(style.icon("check"), apply_text)
+        self.apply_button.setProperty("variant", "power")
+        self.apply_button.setToolTip("Write the result into the buffer as one undoable step (Enter)")
+        self.apply_button.clicked.connect(self.applyRequested)
+        main.addWidget(self.preview_button, 1 if stacked else 0)
+        main.addWidget(self.apply_button, 1 if stacked else 0)
+
+    def set_state(self, *, can_apply: bool, can_undo: bool, previewing: bool | None = None,
+                  can_preview: bool = True) -> None:
+        self.apply_button.setEnabled(can_apply)
+        self.undo_button.setEnabled(can_undo)
+        self.preview_button.setEnabled(can_preview)
+        if self.discard_button is not None:
+            self.discard_button.setEnabled(can_apply)
+        if previewing is not None and previewing != self.preview_button.isChecked():
+            self.preview_button.blockSignals(True)
+            self.preview_button.setChecked(previewing)
+            self.preview_button.blockSignals(False)
 
 
 class ColorEditor(QWidget):
@@ -261,6 +358,7 @@ class ToolPanel(QWidget):
     def __init__(self, settings: ToolSettings, parent=None):
         super().__init__(parent)
         self.settings = settings
+        self._pending, self._can_undo = None, False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 12)
         layout.setSpacing(8)
@@ -273,6 +371,25 @@ class ToolPanel(QWidget):
         layout.addLayout(head)
         self.hint = muted()
         layout.addWidget(self.hint)
+        self.power_card = QFrame()
+        self.power_card.setProperty("role", "card")
+        pc = QVBoxLayout(self.power_card)
+        pc.setContentsMargins(10, 8, 10, 8)
+        pc.setSpacing(8)
+        self.power_status = muted("", "muted")
+        pc.addWidget(self.power_status)
+        self.power = PowerActions(discard=True, stacked=True)
+        pc.addWidget(self.power)
+        layout.addWidget(self.power_card)
+        self.paint_block = QWidget()
+        cl = QVBoxLayout(self.paint_block)
+        cl.setContentsMargins(0, 4, 0, 0)
+        cl.setSpacing(8)
+        cl.addWidget(section("Colour"))
+        self.color = ColorEditor(settings)
+        self.color.changed.connect(self.changed)
+        cl.addWidget(self.color)
+        layout.addWidget(self.paint_block)
         self.stack = QStackedWidget()
         layout.addWidget(self.stack)
         self.pages: dict[str, QWidget] = {}
@@ -282,10 +399,6 @@ class ToolPanel(QWidget):
         pl = QVBoxLayout(page)
         pl.setContentsMargins(0, 4, 0, 0)
         pl.setSpacing(8)
-        pl.addWidget(section("Colour"))
-        self.color = ColorEditor(settings)
-        self.color.changed.connect(self.changed)
-        pl.addWidget(self.color)
         pl.addWidget(section("Size"))
         size_row = QHBoxLayout()
         self.size_slider = QSlider(Qt.Orientation.Horizontal)
@@ -337,11 +450,70 @@ class ToolPanel(QWidget):
         sl.addLayout(buttons)
         self.pages["select"] = page
 
+        # paint bucket
+        page = QWidget()
+        bl = QVBoxLayout(page)
+        bl.setContentsMargins(0, 4, 0, 0)
+        bl.setSpacing(8)
+        bl.addWidget(section("Tolerance"))
+        row, _, self.tolerance_spin = labelled_slider(0, 255, settings.tolerance, "Bucket tolerance")
+        self.tolerance_spin.setToolTip("How far each channel may differ from the clicked pixel and still be filled. "
+                                       "0 fills only identical bytes.")
+        self.tolerance_spin.valueChanged.connect(lambda v: self._set("tolerance", v))
+        bl.addLayout(row)
+        self.contiguous_box = QCheckBox("Contiguous")
+        self.contiguous_box.setChecked(settings.contiguous)
+        self.contiguous_box.setToolTip("Fill only the 4-connected region around the click. Unticked: every matching "
+                                       "pixel in the image.")
+        self.contiguous_box.toggled.connect(lambda v: self._set("contiguous", v))
+        bl.addWidget(self.contiguous_box)
+        bl.addWidget(muted("A pixel matches when every channel, alpha included, is within the tolerance. No "
+                           "anti-aliasing, no feathering, no regrets.", "faint"))
+        self.pages["bucket"] = page
+
+        # shapes
+        page = QWidget()
+        shl = QVBoxLayout(page)
+        shl.setContentsMargins(0, 4, 0, 0)
+        shl.setSpacing(8)
+        shl.addWidget(section("Shape"))
+        picker = QFrame()
+        picker.setProperty("role", "segmented")
+        pk = QHBoxLayout(picker)
+        pk.setContentsMargins(2, 2, 2, 2)
+        pk.setSpacing(2)
+        self.shape_buttons: dict[str, QToolButton] = {}
+        for key, text, icon in SHAPE_CHOICES:
+            b = QToolButton()
+            b.setIcon(style.icon(icon))
+            b.setText(text)
+            b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            b.setCheckable(True)
+            b.setAutoExclusive(True)
+            b.setAccessibleName(text)
+            b.toggled.connect(lambda on, k=key: on and self._set("shape", k))
+            pk.addWidget(b, 1)
+            self.shape_buttons[key] = b
+        shl.addWidget(picker)
+        shl.addWidget(section("Stroke"))
+        row, _, self.stroke_spin = labelled_slider(1, 64, settings.stroke, "Shape stroke width", " px")
+        self.stroke_spin.valueChanged.connect(lambda v: self._set("stroke", v))
+        shl.addLayout(row)
+        self.filled_box = QCheckBox("Filled")
+        self.filled_box.setChecked(settings.filled)
+        self.filled_box.toggled.connect(lambda v: self._set("filled", v))
+        shl.addWidget(self.filled_box)
+        shl.addWidget(muted("Aliased: every pixel is either written exactly or left alone. Outlines grow inward "
+                            "from the dragged box; lines use the pencil's square dab.", "faint"))
+        self.pages["shape"] = page
+
         for key in ("inspect", "eyedropper", "hand", "zoom"):
             self.pages[key] = QWidget()
         for page in self.pages.values():
             self.stack.addWidget(page)
         layout.addStretch(1)
+        self.set_shape(settings.shape)
+        self.set_pending(None)
         self.set_tool("inspect")
 
     def set_tool(self, tool: str) -> None:
@@ -352,6 +524,37 @@ class ToolPanel(QWidget):
         self.stack.setCurrentWidget(self.pages[tool])
         page = self.pages[tool]
         self.stack.setVisible(page.layout() is not None)
+        self.paint_block.setVisible(tool in PAINT_TOOLS)
+        self.power_card.setVisible(tool in ("bucket", "shape"))
+        self.tool = tool
+        self.set_pending(self._pending, can_undo=self._can_undo)
+
+    def set_shape(self, kind: str) -> None:
+        self.shape_buttons[kind].setChecked(True)
+        self.filled_box.setEnabled(kind != "line")
+
+    def _set(self, name: str, value) -> None:
+        setattr(self.settings, name, value)
+        if name == "shape":
+            self.filled_box.setEnabled(value != "line")
+        self.changed.emit()
+
+    def set_pending(self, pending, *, can_undo: bool = False, previewing: bool = True) -> None:
+        """Show the canvas tool's staged result (or the prompt to make one)."""
+        self._pending, self._can_undo = pending, can_undo
+        tool = getattr(self, "tool", "inspect")
+        self.power.apply_button.setText(pending.verb if pending is not None
+                                        else {"bucket": "Fill", "shape": "Draw"}.get(tool, "Apply"))
+        if pending is not None:
+            style.set_pill(self.power_status, "warn", f"Previewing {pending.describe()}. Nothing is written yet.")
+        else:
+            self.power_status.setProperty("pill", None)
+            style.repolish(self.power_status)
+            self.power_status.setText("Click a pixel to preview the fill." if tool == "bucket"
+                                      else "Drag on the canvas to preview a shape.")
+        self.power.set_state(can_apply=pending is not None, can_undo=can_undo,
+                             previewing=previewing if pending is not None else False,
+                             can_preview=pending is not None)
 
     def set_mode(self, mode: str | None) -> None:
         self.color.set_mode(mode)
@@ -917,7 +1120,15 @@ class HistoryPanel(QWidget):
             self.jumpRequested.emit(row)
 
 
+POWER_ICONS = (("Paint bucket", "bucket"), ("Line", "shape-line"), ("Rectangle", "shape-rect"),
+               ("Ellipse", "shape-ellipse"), ("Gaussian blur", "blur"), ("Invert", "invert"), ("Nuke", "nuke"),
+               ("Cosmic ray", "cosmic"))
+
+
 def _command_icon(cmd) -> str:
+    for prefix, icon in POWER_ICONS:
+        if cmd.label.startswith(prefix):
+            return icon
     if isinstance(cmd, TransformCommand):
         return {"rotate_cw": "rotate-cw", "rotate_ccw": "rotate-ccw", "rotate_180": "rotate-180",
                 "flip_h": "flip-h", "flip_v": "flip-v"}.get(cmd.op, "rotate-cw")

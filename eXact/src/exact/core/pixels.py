@@ -71,10 +71,26 @@ def pixel_offset(x: int, y: int, width: int, channels: int) -> int:
     return (y * width + x) * channels
 
 
+def pixel_changes(values: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    """Bool mask of pixels whose channels differ (the last axis is the channel axis).
+
+    RGBA compares each pixel as one uint32, RGB ORs the channels: both are many times
+    faster than ``(values != reference).any(axis=-1)``, whose inner loop is 3 or 4 long.
+    """
+    if values.shape[-1] == 4 and values.strides[-1] == reference.strides[-1] == 1:
+        try:
+            return (values.view(np.uint32) != reference.view(np.uint32))[..., 0]
+        except ValueError:  # a view whose pixels are not 4 contiguous bytes
+            pass
+    neq = values[..., 0] != reference[..., 0]
+    for c in range(1, values.shape[-1]):
+        neq |= values[..., c] != reference[..., c]
+    return neq
+
+
 def diff_counts(values: np.ndarray, reference: np.ndarray) -> tuple[int, int]:
     """Return (differing pixels, differing channel bytes) between two equal-shape arrays.
 
     The last axis is the channel axis.
     """
-    neq = values != reference
-    return int(neq.any(axis=-1).sum()), int(neq.sum())
+    return int(np.count_nonzero(pixel_changes(values, reference))), int(np.count_nonzero(values != reference))
