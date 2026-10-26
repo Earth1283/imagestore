@@ -26,6 +26,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt     # Pillow, rich: everything the command line needs
 pip install -r requirements-gui.txt # optional: PyQt6 for the graphical interface
+pip install -r requirements-numpy.txt # optional: NumPy, several times faster error correction
 ```
 
 ## Usage
@@ -100,6 +101,8 @@ used only when it actually makes the payload smaller. LZMA usually wins on text 
 of two) and capped by `--window` (64 MiB by default), so repeats far apart in a large archive are
 still found; encoding a large folder can use around 0.5 GB of RAM at the default, decoding far
 less. The window is recorded as the first byte of an LZMA payload.
+If your Python was built without the `lzma` module (it needs the xz development files), ImageStore
+still runs: it compresses with zlib instead and reports a clear error for images that need LZMA.
 
 Folders are tarred first, and tar pads every entry to a 512-byte block, so a folder with many
 small files in nested subfolders is mostly zeros. zlib hides that, but when it is off (or does
@@ -116,7 +119,11 @@ per block (about 3%), and the level is recognised again from the pixels, so no e
 field is needed. The SHA-256 is still the final check: a repair that does not reproduce the
 original is refused, never returned. Costs: the image grows by the percentage, encoding adds
 roughly 0.1 s per MB, opening an error-corrected image reads all of it into memory, and
-repairing damage takes a few seconds per MB. It cannot undo lossy re-encoding, which changes
+repairing damage takes a few seconds per MB. NumPy is optional: when it is installed the coder
+runs across all blocks at once: for 4 MB at 25% parity, encoding takes 0.11 s instead of 0.68 s,
+opening an intact image 0.10 s instead of 0.80 s, and repairing an image with every block
+damaged 2.6 s instead of 26 s. Without it the
+same code runs in plain Python, and `IMAGESTORE_NO_NUMPY=1` forces that. It cannot undo lossy re-encoding, which changes
 every pixel slightly, and it does not help if so much is damaged that the image is no longer
 recognised as an ImageStore image.
 

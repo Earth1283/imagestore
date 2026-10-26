@@ -1,0 +1,3 @@
+-r requirements.txt
+# Optional: makes error correction (--ecc) several times faster; the tool works without it.
+numpy

@@ -12,6 +12,19 @@ from imagestore import ImageStoreError
 PAYLOAD = random.Random(5).randbytes(60_000)
 
 
+@pytest.fixture(autouse=True, params=["numpy", "python"])
+def backend(request, istore, monkeypatch):
+    """Run every test here on both implementations (NumPy when installed, and the pure Python fallback)."""
+    if request.param == "numpy":
+        pytest.importorskip("numpy")
+        if istore.np is None:  # the module was imported with IMAGESTORE_NO_NUMPY set
+            import numpy
+            monkeypatch.setattr(istore, "np", numpy)
+    else:
+        monkeypatch.setattr(istore, "np", None)
+    return request.param
+
+
 def _damage(png, dst, ranges, xor=0xA5):
     """Re-save an RGBA PNG with each (start, stop) range of its pixel bytes XORed."""
     with Image.open(png) as im:
@@ -231,3 +244,117 @@ def test_ecc_option_rejects_out_of_range(istore, text, capsys):
 
 def test_ecc_is_off_by_default(istore):
     assert istore.build_parser().parse_args(["encode", "x"]).ecc == 0
+
+
+# ----------------------------------------------------- the two implementations agree
+
+def test_both_backends_write_identical_images(istore, backend):
+    np = pytest.importorskip("numpy")
+    if backend == "python":
+        pytest.skip("compares both backends itself")
+    out = {}
+    for name, module in (("numpy", np), ("python", None)):
+        istore.np = module
+        img, _ = istore.encode(io.BytesIO(PAYLOAD), "blob.bin", False, 0, ecc=48)
+        out[name] = img.tobytes()
+    istore.np = np
+    assert out["numpy"] == out["python"]
+
+
+@pytest.mark.parametrize("parity", [8, 24, 64, 128])
+def test_vectorised_repair_matches_the_scalar_coder_block_by_block(istore, backend, parity):
+    np = pytest.importorskip("numpy")
+    if backend == "python":
+        pytest.skip("compares both backends itself")
+    rng, rs, k = random.Random(parity), istore._rs(parity), 255 - parity
+    sent, received = [], []
+    for _ in range(80):
+        data = rng.randbytes(k)
+        block = bytearray(data) + rs.parity_of(data).to_bytes(parity, "big")
+        sent.append(bytes(block))
+        for pos in rng.sample(range(255), rng.choice([0, 1, parity // 2, parity // 2 + 1, parity // 2 + 6])):
+            block[pos] ^= rng.randint(1, 255)
+        received.append(bytes(block))
+    grid = np.frombuffer(b"".join(received), np.uint8).reshape(80, 255).copy()
+    rem = istore._np_parity(rs, grid[:, :k].T) ^ grid[:, k:]
+    bad = np.nonzero(rem.any(axis=1))[0]
+    batch = grid[bad].copy()
+
+    ok = istore._np_repair(rs, batch, rem[bad])
+
+    for n, i in enumerate(bad):
+        scalar = bytearray(received[i])
+        assert rs.repair(scalar) == bool(ok[n])
+        assert bytes(batch[n]) == bytes(scalar)  # repaired the same way, or both left alone
+        if ok[n]:
+            assert bytes(scalar) == sent[i]
+
+
+def test_damage_that_cannot_be_repaired_gives_the_same_report_on_both_backends(istore, archive, tmp_path, backend):
+    np = pytest.importorskip("numpy")
+    if backend == "python":
+        pytest.skip("compares both backends itself")
+    png, _ = archive(12)
+    with Image.open(png) as im:
+        n = im.width * im.height * 4
+    blocks = n // 255
+    bad, _ = _damage(png, tmp_path / "bad.png", [(j * blocks, j * blocks + 30) for j in range(0, 200, 2)])
+    reports = {}
+    for name, module in (("numpy", np), ("python", None)):
+        istore.np = module
+        img = istore.open_image(bad)
+        reports[name] = istore._ecc_open(img, None)[1]
+    istore.np = np
+    assert reports["numpy"] == reports["python"] and reports["numpy"].failed_blocks > 0
+
+
+# ------------------------------------------------------------ without NumPy at all
+
+@pytest.mark.parametrize("how", ["env", "missing"])
+def test_error_correction_works_when_numpy_is_off_or_not_installed(istore, tmp_path, how):
+    import subprocess
+    import sys
+    block = {"env": "import os; os.environ['IMAGESTORE_NO_NUMPY'] = '1'\n",
+             "missing": "import sys; sys.modules['numpy'] = None\n"}[how]
+    script = block + (
+        "import imagestore as m, pathlib, random\n"
+        "assert m.np is None\n"
+        f"d = pathlib.Path({str(tmp_path)!r}); src = d / 'a.bin'; src.write_bytes(random.Random(1).randbytes(30000))\n"
+        "m.encode_path(src, d / 'a.png', ecc=20, compress=False)\n"
+        "from PIL import Image\n"
+        "im = Image.open(d / 'a.png'); raw = bytearray(im.tobytes())\n"
+        "for i in range(len(raw) // 3, len(raw) // 3 + len(raw) // 40): raw[i] ^= 0xFF\n"
+        "Image.frombytes('RGBA', im.size, bytes(raw)).save(d / 'bad.png')\n"
+        "r = m.decode_path(d / 'bad.png', d / 'out')\n"
+        "assert r.out.read_bytes() == src.read_bytes() and r.meta.ecc.repaired_bytes > 0\n"
+    )
+    done = subprocess.run([sys.executable, "-c", script], cwd=istore.__file__.rsplit("/", 1)[0],
+                          capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+
+
+def test_numpy_tip_only_appears_without_numpy_on_big_error_corrected_images(istore, tmp_path, monkeypatch, capsys):
+    src = tmp_path / "blob.bin"
+    src.write_bytes(PAYLOAD)
+    res = istore.encode_path(src, tmp_path / "e.png", compress=False, ecc=12)
+    monkeypatch.setattr(istore, "ECC_HINT_BYTES", 1000)
+    monkeypatch.setattr(istore, "console", istore.Console(width=120, force_terminal=False))
+    monkeypatch.setattr(istore, "np", None)
+    istore.render_encode(res)
+    assert "pip install numpy" in capsys.readouterr().out
+    monkeypatch.setattr(istore, "np", pytest.importorskip("numpy"))
+    istore.render_encode(res)
+    assert "pip install numpy" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("parity", range(8, 129, 8))
+def test_detection_names_the_exact_parity_size_clean_or_damaged(istore, parity):
+    """A codeword of a stronger code also checks out under every weaker one, so detection must not stop early."""
+    img, _ = istore.encode(io.BytesIO(PAYLOAD[:20_000]), "x.bin", False, 0, ecc=parity)
+    clean = bytearray(img.tobytes())
+    blocks = len(clean) // 255
+    assert istore._ecc_detect(clean, blocks) == parity
+    damaged = bytearray(clean)
+    for i in range(blocks * 3, blocks * (3 + parity // 4)):  # parity / 4 bytes lost in every block
+        damaged[i] ^= 0x5A
+    assert istore._ecc_detect(damaged, blocks) == parity

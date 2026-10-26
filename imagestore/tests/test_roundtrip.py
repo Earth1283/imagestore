@@ -625,3 +625,42 @@ def test_window_option_rejects_out_of_range(istore, text, capsys):
 
 def test_window_defaults_to_64_mib(istore):
     assert istore.build_parser().parse_args(["encode", "x"]).window == 64 << 20
+
+
+# ---------------------------------------------------- a Python built without lzma
+
+def test_encode_falls_back_to_zlib_without_lzma(istore, tmp_path, monkeypatch):
+    monkeypatch.setattr(istore, "lzma", None)
+    src = _write(tmp_path / "t.txt", _text_blob())
+    res = istore.encode_path(src, tmp_path / "t.png")
+    assert res.meta.method == "zlib"
+    assert istore.decode_path(tmp_path / "t.png", tmp_path / "out").out.read_bytes() == src.read_bytes()
+
+
+def test_reading_an_lzma_image_without_lzma_explains_itself(istore, tmp_path, monkeypatch):
+    src = _write(tmp_path / "t.txt", _text_blob())
+    istore.encode_path(src, tmp_path / "t.png")
+    monkeypatch.setattr(istore, "lzma", None)
+    with pytest.raises(ImageStoreError) as ei:
+        istore.decode_path(tmp_path / "t.png", tmp_path / "out")
+    assert ei.value.kind == "no_lzma"
+    assert not (tmp_path / "out").exists()
+    assert "xz" in istore.explain(ei.value).hint
+
+
+def test_the_tool_starts_and_works_with_the_lzma_import_blocked(istore, tmp_path):
+    import subprocess
+    import sys
+    script = (
+        "import sys; sys.modules['lzma'] = None\n"
+        "import imagestore as m, pathlib\n"
+        "assert not m.HAVE_LZMA\n"
+        f"src = pathlib.Path({str(tmp_path)!r}) / 'a.txt'; src.write_text('hello ' * 4000)\n"
+        "res = m.encode_path(src, src.with_suffix('.png'))\n"
+        "assert res.meta.method == 'zlib', res.meta.method\n"
+        "out = m.decode_path(src.with_suffix('.png'), src.parent / 'out').out\n"
+        "assert out.read_text() == 'hello ' * 4000\n"
+    )
+    done = subprocess.run([sys.executable, "-c", script], cwd=istore.__file__.rsplit("/", 1)[0],
+                          capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr

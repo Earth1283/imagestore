@@ -313,8 +313,10 @@ class EncodePage(Page):
         saved = self.settings.value("window_mib", core.LZMA_WINDOW >> 20, type=int)
         self.window_size.setCurrentIndex(max(0, self.window_size.findData(saved)))
         self.window_size.currentIndexChanged.connect(lambda _: self.settings.setValue("window_mib", self.window_mib()))
-        self.compress.toggled.connect(self.window_size.setEnabled)
-        self.window_size.setEnabled(self.compress.isChecked())
+        self.compress.toggled.connect(lambda on: self.window_size.setEnabled(on and core.HAVE_LZMA))
+        self.window_size.setEnabled(self.compress.isChecked() and core.HAVE_LZMA)
+        if not core.HAVE_LZMA:
+            self.window_size.setToolTip("This Python was built without LZMA, so zlib is used instead.")
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(label("LZMA window", "key"))

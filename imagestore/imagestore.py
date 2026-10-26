@@ -13,10 +13,10 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import hashlib
+import functools
 import hmac
 import io
 import itertools
-import lzma
 import math
 import os
 import re
@@ -27,12 +27,19 @@ import tarfile
 import tempfile
 import threading
 import zlib
-import functools
 from collections.abc import Callable, Collection, Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
+try:
+    import lzma
+except ImportError:  # a Python built without the xz headers has no lzma module
+    lzma = None
+try:
+    import numpy as np
+except ImportError:  # optional: error correction is several times faster with it
+    np = None
 from PIL import Image
 from rich.console import Console
 from rich.markup import escape
@@ -41,6 +48,9 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
 
+HAVE_LZMA = lzma is not None
+if os.environ.get("IMAGESTORE_NO_NUMPY"):
+    np = None  # force the pure Python paths (used by the tests and for comparing speed)
 MAGIC = b"IMST"
 VERSION = 2  # v2: SHA-256 digest replaced the v1 CRC32
 FLAG_ZLIB = 0x01
@@ -187,6 +197,7 @@ def encode(src: BinaryIO, name: str, compress: bool = True, kind: int = 0,
     packed_size = xz_size = squeezed_size = 0
     if compress:
         packed, co = _spool(), zlib.compressobj(9)
+    if compress and lzma:
         win = lzma_window(total, window)
         xz, xz_co = _spool(), lzma.LZMACompressor(lzma.FORMAT_RAW, filters=lzma_filters(win))
         xz_size = xz.write(bytes([win.bit_length() - 1]))
@@ -198,11 +209,13 @@ def encode(src: BinaryIO, name: str, compress: bool = True, kind: int = 0,
             size += len(chunk)
             if co:
                 packed_size += packed.write(co.compress(chunk))
+            if xz_co:
                 xz_size += xz.write(xz_co.compress(chunk))
             if squeezed:
                 squeezed_size += squeezed.write(squeeze(chunk))
         if co:
             packed_size += packed.write(co.flush())
+        if xz_co:
             xz_size += xz.write(xz_co.flush())
     except MemoryError as e:
         raise ImageStoreError("not enough memory to " + (f"compress with a {win >> 20} MiB LZMA window" if win
@@ -322,6 +335,9 @@ def _read_varint(buf: bytearray, pos: int) -> tuple[int, int] | None:
 
 
 def _unlzma(chunks: Iterator[bytes], orig_size: int) -> Iterator[bytes]:
+    if lzma is None:
+        raise ImageStoreError("this image is LZMA-compressed, and this Python was built without lzma support",
+                              "no_lzma")
     chunks = iter(chunks)
     first = next(chunks, b"")
     exp = first[0] if first else 0
@@ -396,6 +412,7 @@ ECC_BLOCK = 255
 ECC_STEP = 8  # parity comes in multiples of this: fewer than 8 and a wrong guess "decodes" anything
 ECC_MAX_PARITY = 128
 ECC_MIN_BLOCKS = 4
+ECC_HINT_BYTES = 16 << 20  # images this big are slow enough without NumPy to be worth a tip
 
 _EXP = [0] * 512
 _LOG = [0] * 256
@@ -432,11 +449,41 @@ class _RS:
             for j, c in enumerate(gen):
                 nxt[j + 1] ^= _gmul(c, _EXP[i])
             gen = nxt
-        # feedback[f] is f * gen (without the leading 1), packed into one integer
-        self.feedback = [int.from_bytes(bytes(_gmul(f, g) for g in gen[1:]), "big") for f in range(256)]
+        self.gen = gen
         self.mask = (1 << 8 * parity) - 1
         self.shift = 8 * (parity - 1)
-        self.times_alpha = [[_gmul(_EXP[j], v) for v in range(256)] for j in range(parity)]
+
+    @functools.cached_property
+    def np_feedback(self):
+        """feedback as a (256, parity) uint8 table, for the vectorised coder"""
+        return _vmul(np.arange(256, dtype=np.uint8)[:, None], np.array(self.gen[1:], dtype=np.uint8)[None, :])
+
+    @functools.cached_property
+    def feedback(self) -> list[int]:
+        """feedback[f] is f * gen (without the leading 1), packed into one integer"""
+        if np is not None:
+            return [int.from_bytes(row.tobytes(), "big") for row in self.np_feedback]
+        return [int.from_bytes(bytes(_gmul(f, g) for g in self.gen[1:]), "big") for f in range(256)]
+
+    @functools.cached_property
+    def times_alpha(self) -> list[list[int]]:
+        return [[_gmul(_EXP[j], v) for v in range(256)] for j in range(self.parity)]
+
+    @functools.cached_property
+    def np_times_alpha(self):
+        return np.array(self.times_alpha, dtype=np.uint8)
+
+    @functools.cached_property
+    def np_columns(self):
+        """What a byte value v at data position j adds to the parity: (data bytes, 256, parity / 8) of
+        64-bit lanes. Parity is linear in the data, so the parity of a block is the XOR of one table
+        row per byte. Position j's row is v times the parity of a block that is 1 at j and 0 elsewhere."""
+        k = ECC_BLOCK - self.parity
+        unit = _np_parity_lfsr(self, np.eye(k, dtype=np.uint8))  # row j: parity of the unit block j
+        exp, log = _np_gf()
+        values = np.arange(256, dtype=np.int32)
+        tables = exp[log[values][None, :, None] + log[unit][:, None, :]]
+        return np.ascontiguousarray(tables).view(np.uint64)
 
     def parity_of(self, data) -> int:
         """Remainder of data(x) * x^parity modulo the generator, as one big-endian integer."""
@@ -522,9 +569,134 @@ class _RS:
         return True
 
 
-@functools.lru_cache(maxsize=4)
+@functools.lru_cache(maxsize=32)  # detection tries every size
 def _rs(parity: int) -> _RS:
     return _RS(parity)
+
+
+# The same coder over many blocks at once with NumPy: every step below is one array operation
+# across all blocks, so the work that costs a Python loop per block above is done in C.
+
+ECC_CHUNK = 1 << 15  # blocks per batch: bounds memory and gives progress
+
+
+@functools.lru_cache(maxsize=1)
+def _np_gf():
+    """exp and log tables where log(0) is 512, past any real sum of logs (at most 508), and exp is zero
+    from 512 on: multiplying by zero then needs no special case."""
+    exp = np.zeros(1536, np.uint8)
+    exp[:510] = _EXP[:255] * 2
+    log = np.array(_LOG, dtype=np.int32)
+    log[0] = 512
+    return exp, log
+
+
+def _vmul(a, b):
+    exp, log = _np_gf()
+    return exp[log[a] + log[b]]
+
+
+def _np_parity_lfsr(rs: _RS, rows):
+    """Block-by-block shift register, one step per data byte (used to build the tables below).
+    rows is (data bytes, blocks); returns (blocks, parity)."""
+    table = rs.np_feedback
+    reg = np.zeros((rows.shape[1], rs.parity), np.uint8)
+    for row in rows:
+        fb = row ^ reg[:, 0]
+        reg[:, :-1] = reg[:, 1:]
+        reg[:, -1] = 0
+        reg ^= table[fb]
+    return reg
+
+
+def _np_parity(rs: _RS, rows):
+    """Parity of every block at once. rows is (data bytes, blocks): row j holds byte j of each block.
+    Returns (blocks, parity); XOR the stored parity into it to get the remainder (all zero when intact).
+    One table lookup and one XOR per data byte, on 64-bit lanes (parity is a multiple of 8 bytes)."""
+    tables = rs.np_columns
+    acc = np.zeros((rows.shape[1], rs.parity // 8), np.uint64)
+    for j in range(tables.shape[0]):
+        acc ^= tables[j][rows[j]]
+    return acc.view(np.uint8)
+
+
+def _np_syndromes(rs: _RS, rem):
+    """All syndromes of every remainder row, evaluated together (Horner, one step per byte)."""
+    columns = np.arange(rs.parity)[None, :]
+    acc = np.zeros(rem.shape, np.uint8)
+    for b in range(rs.parity):
+        acc = rs.np_times_alpha[columns, acc] ^ rem[:, b:b + 1]
+    return acc
+
+
+def _np_locator(syn):
+    """Berlekamp-Massey for all blocks at once (the division-free form, so no per-block inversion).
+    Returns the locator polynomials, lowest degree first, and their degrees. A block with more errors
+    than the code can fix ends up with a degree past parity // 2, so the polynomials can be kept that
+    narrow: whatever they hold for such a block is rejected by the caller."""
+    count, parity = syn.shape
+    width = parity // 2 + 2
+    lam = np.zeros((count, width), np.uint8)
+    lam[:, 0] = 1
+    prev, gamma, deg = lam.copy(), np.ones(count, np.uint8), np.zeros(count, np.int64)
+    for n in range(parity):
+        m = min(n + 1, width)
+        delta = np.bitwise_xor.reduce(_vmul(lam[:, :m], syn[:, n - m + 1:n + 1][:, ::-1]), axis=1)
+        shifted = np.zeros_like(prev)
+        shifted[:, 1:] = prev[:, :-1]
+        new = _vmul(gamma[:, None], lam) ^ _vmul(delta[:, None], shifted)
+        swap = (delta != 0) & (2 * deg <= n)
+        prev = np.where(swap[:, None], lam, shifted)
+        gamma = np.where(swap, delta, gamma)
+        deg = np.where(swap, n + 1 - deg, deg)
+        lam = new
+    return lam, deg
+
+
+def _np_eval(coeffs, exps, outer: bool = False):
+    """XOR over i of coeffs[:, i] * alpha^exps[i], skipping zero coefficients. exps[i] pairs with the rows
+    of coeffs one to one, or with outer=True is one vector of exponents applied to every row."""
+    exp, log = _np_gf()
+    out = 0
+    for i in range(coeffs.shape[1]):
+        c = coeffs[:, i]
+        out = out ^ exp[(log[c][:, None] if outer else log[c]) + exps[i]]
+    return out
+
+
+def _np_repair(rs: _RS, blocks, rem):
+    """Repair damaged blocks in place. blocks is (n, 255), rem the matching remainders.
+    Returns which of them could be repaired; the others are left untouched."""
+    exp, log = _np_gf()
+    k, parity, count = ECC_BLOCK - rs.parity, rs.parity, len(blocks)
+    syn = _np_syndromes(rs, rem)
+    lam, deg = _np_locator(syn)
+    ok = (deg > 0) & (deg <= parity // 2)
+    if not ok.any():
+        return ok
+    top = int(deg[ok].max())
+    # Chien search: position e of a block has locator alpha^e, so evaluate at alpha^-e for all e
+    at = (ECC_BLOCK - np.arange(ECC_BLOCK)) % ECC_BLOCK
+    powers = np.array([(i * at) % ECC_BLOCK for i in range(top + 1)])
+    roots = _np_eval(lam[:, :top + 1], powers, outer=True) == 0
+    ok &= roots.sum(axis=1) == deg
+    # Forney: the error value at each root, from the evaluator polynomial
+    omega = np.zeros((count, parity), np.uint8)
+    for j in range(top + 1):
+        omega[:, j:] ^= _vmul(lam[:, j:j + 1], syn[:, :parity - j])
+    row, pos = np.nonzero(roots & ok[:, None])
+    x = at[pos]
+    num = _np_eval(omega[row], np.array([(i * x) % ECC_BLOCK for i in range(parity)]))
+    odd = lam[row][:, 1:top + 1:2]
+    den = _np_eval(odd, np.array([((2 * i) * x) % ECC_BLOCK for i in range(odd.shape[1])]))
+    ok[row[den == 0]] = False
+    fix = np.where((num == 0) | (den == 0), np.uint8(0), exp[(log[num] - log[den] + pos) % ECC_BLOCK])
+    fixed = blocks.copy()
+    fixed[row, ECC_BLOCK - 1 - pos] ^= fix
+    ok &= ~(_np_parity(rs, fixed[:, :k].T) ^ fixed[:, k:]).any(axis=1)
+    blocks[ok] = fixed[ok]
+    return ok
+
 
 
 
@@ -536,10 +708,18 @@ def _ecc_encode(data: bytearray, used: int, blocks: int, parity: int, size: int,
     full = -(-used // k)
     if task:
         task.phase("Adding error correction", full)
-    for i in range(full):
-        par[i * parity:(i + 1) * parity] = rs.parity_of(view[i * k:(i + 1) * k]).to_bytes(parity, "big")
-        if task and i % 256 == 255:
-            task.advance(256)
+    if np is not None:
+        rows = np.frombuffer(data, np.uint8)[:full * k].reshape(full, k)
+        for a in range(0, full, ECC_CHUNK):
+            b = min(a + ECC_CHUNK, full)
+            par[a * parity:b * parity] = _np_parity(rs, rows[a:b].T).tobytes()
+            if task:
+                task.advance(b - a)
+    else:
+        for i in range(full):
+            par[i * parity:(i + 1) * parity] = rs.parity_of(view[i * k:(i + 1) * k]).to_bytes(parity, "big")
+            if task and i % 256 == 255:
+                task.advance(256)
     out = bytearray(size)
     for j in range(k):
         out[j * blocks:(j + 1) * blocks] = data[j::k]
@@ -554,13 +734,40 @@ def _ecc_detect(buf: bytearray, blocks: int) -> int | None:
     even when every block is damaged."""
     picks = [b for b in (bytearray(buf[i:i + ECC_BLOCK * blocks:blocks])
                          for i in sorted({t * blocks // 8 for t in range(8)})) if any(b)]
+    sizes = range(ECC_STEP, ECC_MAX_PARITY + 1, ECC_STEP)
+    for parity in reversed(sizes):  # an undamaged image is recognised without trying any repairs
+        # (a codeword of a stronger code also checks out under every weaker one, so take the largest)
+        rs, k = _rs(parity), ECC_BLOCK - parity
+        if picks and all(rs.parity_of(b[:k]) == int.from_bytes(b[k:], "big") for b in picks):
+            return parity
     best, best_score = None, 0
-    for parity in range(ECC_STEP, ECC_MAX_PARITY + 1, ECC_STEP):
+    for parity in sizes:
         rs = _rs(parity)
         score = sum(rs.repair(bytearray(b)) for b in picks)
         if score >= best_score and score * 3 >= len(picks) * 2:
             best, best_score = parity, score
     return best
+
+
+def _ecc_repair_np(rs: _RS, buf: bytearray, blocks: int, report: EccReport, task: Task | None) -> None:
+    """Check every block and repair the damaged ones, a batch at a time, writing the fixes into buf."""
+    k = ECC_BLOCK - rs.parity
+    grid = np.frombuffer(buf, np.uint8)[:ECC_BLOCK * blocks].reshape(ECC_BLOCK, blocks)  # column i = block i
+    for a in range(0, blocks, ECC_CHUNK):
+        b = min(a + ECC_CHUNK, blocks)
+        part = grid[:, a:b]
+        rem = _np_parity(rs, part[:k]) ^ part[k:].T
+        bad = np.nonzero(rem.any(axis=1))[0]
+        if bad.size:
+            damaged = np.ascontiguousarray(part[:, bad].T)
+            before = damaged.copy()
+            ok = _np_repair(rs, damaged, rem[bad])
+            report.failed_blocks += int((~ok).sum())
+            report.repaired_blocks += int(ok.sum())
+            report.repaired_bytes += int((damaged[ok] != before[ok]).sum())
+            grid[:, a + bad[ok]] = damaged[ok].T
+        if task:
+            task.advance(b - a)
 
 
 def _ecc_open(img: Image.Image, task: Task | None) -> tuple[bytearray, EccReport] | None:
@@ -575,20 +782,23 @@ def _ecc_open(img: Image.Image, task: Task | None) -> tuple[bytearray, EccReport
     report = EccReport(parity, blocks)
     if task:
         task.phase("Checking error correction", blocks)
-    for i in range(blocks):
-        block = bytearray(buf[i:ECC_BLOCK * blocks:blocks])
-        if any(block):  # all-zero blocks are padding
-            before = bytes(block)
-            if not rs.repair(block):
-                report.failed_blocks += 1
-            elif before != block:
-                report.repaired_blocks += 1
-                for m in range(ECC_BLOCK):
-                    if before[m] != block[m]:
-                        buf[m * blocks + i] = block[m]
-                        report.repaired_bytes += 1
-        if task and i % 256 == 255:
-            task.advance(256)
+    if np is not None:
+        _ecc_repair_np(rs, buf, blocks, report, task)
+    else:
+        for i in range(blocks):
+            block = bytearray(buf[i:ECC_BLOCK * blocks:blocks])
+            if any(block):  # all-zero blocks are padding
+                before = bytes(block)
+                if not rs.repair(block):
+                    report.failed_blocks += 1
+                elif before != block:
+                    report.repaired_blocks += 1
+                    for m in range(ECC_BLOCK):
+                        if before[m] != block[m]:
+                            buf[m * blocks + i] = block[m]
+                            report.repaired_bytes += 1
+            if task and i % 256 == 255:
+                task.advance(256)
     data = bytearray(blocks * k)
     for j in range(k):
         data[j::k] = buf[j * blocks:(j + 1) * blocks]
@@ -1264,6 +1474,10 @@ _EXPLAIN = {
              "The zlib or LZMA stream inside the image could not be decompressed. Pixel values changed after "
              "encoding (lossy re-compression, colour management or alpha premultiplication). Nothing is "
              "written when this check fails."),
+    "no_lzma": ("This Python cannot read LZMA",
+                "The image is LZMA-compressed, but the Python running ImageStore was built without the lzma "
+                "module (usually because the xz development files were missing when it was compiled). "
+                "Use a Python that has it, or decode on another machine."),
     "ecc": ("Too damaged for error correction",
             "This image has error correction, but more of it is damaged than the parity can repair, "
             "or its error-correction data is missing. Nothing is written when this check fails; try "
@@ -1471,7 +1685,11 @@ def render_encode(r: EncodeResult) -> None:
         ("Output", escape(show_path(r.out))),
         ("Original", human(m.orig_size)),
         ("Stored", _payload_line(r)),
+        *([("Note", "[yellow]LZMA is not available in this Python build, so zlib was used[/]")]
+          if r.compress_requested and not HAVE_LZMA else []),
         *([("Error correction", ecc_text(m.ecc, decoding=False))] if m.ecc else []),
+        *([("Tip", "[dim]pip install numpy makes error correction several times faster[/]")]
+          if m.ecc and np is None and r.capacity > ECC_HINT_BYTES else []),
         *([("Duplicates", f"{r.duplicates:,} identical {'file' if r.duplicates == 1 else 'files'} stored once  "
                           f"[dim]· {human(r.duplicate_bytes)} not stored[/]")] if r.duplicates else []),
         ("PNG file", f"{human(r.png_size)} on disk"),
