@@ -12,6 +12,7 @@ import os
 import time
 from dataclasses import dataclass, field
 
+from PyQt6 import sip
 from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QGuiApplication
 from PyQt6.QtWidgets import (
@@ -88,6 +89,7 @@ def chip(name: str) -> QLabel:
     w.setFixedWidth(16)
     w.setAlignment(Qt.AlignmentFlag.AlignCenter)
     w.setStyleSheet(f"color: {style.tokens()[CHANNEL_TOKENS[name]]}; font-weight: 700;")
+    _chips[:] = [(c, n) for c, n in _chips if not sip.isdeleted(c)]  # closed dialogs leave dead chips
     _chips.append((w, name))
     return w
 

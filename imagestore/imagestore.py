@@ -292,6 +292,7 @@ class _Compressor:
     def finish(self) -> None:
         if self.method != "lzma":
             self._out(self.co.flush())
+            self.co = None  # a multithreaded zstd context keeps hundreds of MiB until it is freed
             return
         if self.block:
             self._submit(self.block)
@@ -299,12 +300,18 @@ class _Compressor:
         while self.pending:
             self._out(self.pending.popleft().result())
         self._out(b"\x00")
+        self._shutdown()
 
-    def close(self) -> None:
+    def _shutdown(self) -> None:
         if self.pool:
             for job in self.pending:  # after a failure or cancel: drop what has not started
                 job.cancel()
             self.pool.shutdown(wait=True)
+            self.pool = None
+
+    def close(self) -> None:
+        self.co = None
+        self._shutdown()
         self.spool.close()
 
 
@@ -364,10 +371,11 @@ def _pack_payload(chunks: Iterator[bytes], total: int, raw: BinaryIO | None, nam
     and lay out the result. raw is the same data as a seekable stream, used when storing it as is
     wins; without one, that case raises _RawWins."""
     sha, size = _Sha256Behind(), 0
-    packer = _Compressor(compressor_for(level), level, total, window) if compress else None
-    squeezed = _spool() if kind & FLAG_DIR and not compress else None  # tar padding is zeros
+    packer = squeezed = None
     squeezed_size = 0
     try:
+        packer = _Compressor(compressor_for(level), level, total, window) if compress else None
+        squeezed = _spool() if kind & FLAG_DIR and not compress else None  # tar padding is zeros
         try:
             for chunk in chunks:
                 sha.update(chunk)
@@ -1021,7 +1029,12 @@ def _ecc_open(img: Image.Image, task: Task | None) -> tuple[bytearray, EccReport
     """Repair an error-corrected image and return the data it carries, or None if it isn't one."""
     if cached := getattr(img, "_imagestore_ecc", None):  # inspect decodes an image more than once
         return cached
-    buf = bytearray(img.tobytes())
+    buf = bytearray(img.width * img.height * BPP)  # filled a band at a time: tobytes() would be a second copy
+    view, pos = memoryview(buf), 0
+    for band in _Pixels(img)._iter_bands():
+        view[pos:pos + len(band)] = band
+        pos += len(band)
+    view.release()
     blocks = len(buf) // ECC_BLOCK
     if blocks < ECC_MIN_BLOCKS or (parity := _ecc_detect(buf, blocks)) is None:
         return None
@@ -1643,12 +1656,13 @@ def _save_png(out: Path, buf: bytearray, width: int, height: int, meta: Meta, ta
               compress: bool) -> None:
     """Write to a temporary sibling, verify it by decoding it again, and only then move it into place.
     When compression was asked for, what is stored is already compressed or did not compress
-    (likewise the parity), so the PNG stores it without deflating it again."""
+    (likewise the parity), so the PNG stores it without deflating it again. buf is emptied once
+    it is written: the caller's reference would otherwise keep it alive through verification."""
     task.phase("Writing PNG", len(buf) + height)
     tmp = out.with_name(f".{out.name}.imagestore-{os.getpid()}.part")
     try:
         write_png(tmp, buf, width, height, task, level=0 if compress else 1)
-        del buf  # free the pixel buffer before verification decodes a second copy
+        buf.clear()  # free the pixel buffer before verification decodes a second copy
         task.check()
         if verify:
             _verify_png(tmp, meta, task)
@@ -1759,6 +1773,7 @@ def decode_path(src: Path, out_dir: Path | None = None, *, force: bool = False, 
     img = open_image(src)
     meta, chunks = decode(img, task)
     width, height = img.size
+    del img  # chunks keeps it while it is still read; an error-corrected image is already copied out
     chunks = task.track(chunks, "Decoding and verifying", meta.orig_size)
     if meta.is_text and text_in_memory:
         data = b"".join(chunks)

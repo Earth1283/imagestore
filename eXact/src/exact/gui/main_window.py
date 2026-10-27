@@ -1214,14 +1214,21 @@ class MainWindow(QMainWindow):
         return report
 
     def compare_dialog(self) -> None:
-        DiffDialog(self, self.doc).exec()
+        dialog = DiffDialog(self, self.doc)
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()  # parented to the window: it would otherwise keep both buffers it compared
 
     def compare_with_disk(self) -> None:
         if self.doc is None or not self.doc.path:
             return
         dialog = DiffDialog(self, self.doc, path_b=self.doc.path, use_current=True)
-        dialog.run_compare()
-        dialog.exec()
+        try:
+            dialog.run_compare()
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
 
     # ---------------------------------------------------------------- transforms
 
@@ -1239,9 +1246,14 @@ class MainWindow(QMainWindow):
         dont_ask = QCheckBox("Don't show this again")
         box.setCheckBox(dont_ask)
         box.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
-        if box.exec() != QMessageBox.StandardButton.Ok:
+        try:
+            answer = box.exec()
+            skip = dont_ask.isChecked()
+        finally:
+            box.deleteLater()
+        if answer != QMessageBox.StandardButton.Ok:
             return False
-        if dont_ask.isChecked():
+        if skip:
             self.settings.setValue("skip_transform_notice", True)
         return True
 
@@ -1362,9 +1374,12 @@ class MainWindow(QMainWindow):
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         form.addRow(buttons)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return None
-        return sx.value(), sy.value()
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return None
+            return sx.value(), sy.value()
+        finally:
+            dialog.deleteLater()
 
     def goto_pixel(self) -> None:
         if self.doc is None:

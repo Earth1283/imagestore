@@ -77,4 +77,7 @@ def show_error(parent, exc: BaseException, action: str = "open", *, note: str = 
     box.setText(f"<b>{ex.title}</b>")
     box.setInformativeText("\n\n".join(t for t in (ex.message, ex.hint, note) if t))
     box.setDetailedText("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
-    box.exec()
+    try:
+        box.exec()
+    finally:
+        box.deleteLater()

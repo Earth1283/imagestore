@@ -1187,7 +1187,10 @@ class MainWindow(QMainWindow):
         box.setText("ImageStore also runs from a terminal, without this window:")
         box.setInformativeText(core.build_parser().format_help())
         box.setStyleSheet(f"QLabel {{ font-family: '{style.mono_font().family()}'; }}")
-        box.exec()
+        try:
+            box.exec()
+        finally:
+            box.deleteLater()
 
     def about(self) -> None:
         QMessageBox.about(
