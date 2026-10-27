@@ -24,7 +24,7 @@ Python 3.8 or newer (developed on 3.14; the code uses the walrus operator and
 cd imagestore
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt     # Pillow, rich: everything the command line needs
+pip install -r requirements.txt     # Pillow, rich (and backports.zstd before Python 3.14)
 pip install -r requirements-gui.txt # optional: PyQt6 for the graphical interface
 pip install -r requirements-numpy.txt # optional: NumPy, several times faster error correction
 ```
@@ -36,6 +36,7 @@ python imagestore.py                          # interactive menu (file browser, 
 
 python imagestore.py encode report.pdf        # -> report.pdf.png
 python imagestore.py encode ./my-folder       # folders are tarred first
+python imagestore.py encode ./big --level max # smallest image, several times slower
 python imagestore.py encode -t "some text"    # -> text.png
 python imagestore.py decode report.pdf.png    # restores report.pdf next to the image
 python imagestore.py info report.pdf.png      # metadata + integrity check (exit 1 if it fails)
@@ -57,8 +58,9 @@ moved into place. `--no-verify` skips the check.
 |---|---|---|
 | `encode` | `-o, --output PATH` | Output PNG (default `<file>.png`, or `text.png` with `-t`) |
 | `encode` | `-t, --text TEXT` | Encode a string instead of a file |
-| `encode` | `--no-compress` | Skip zlib/LZMA pre-compression |
-| `encode` | `--window MiB` | Cap on the LZMA window, 1-1024 (default 64, rounded up to a power of two). Encoding needs about 7x this in RAM; a larger window only helps when repeats are far apart. The GUI has the same setting. |
+| `encode` | `--level LEVEL` | `fast`, `balanced` (default) or `max`. The first two compress with zstd on every core; `max` uses LZMA on every core for the smallest image, several times slower and with much more RAM (see below). The GUI has the same setting. |
+| `encode` | `--no-compress` | Skip pre-compression |
+| `encode` | `--window MiB` | Cap on the compression window, 1-1024 (default 64, rounded up to a power of two). A larger window only helps when repeats are far apart. At `--level max` each core needs about 11x this in RAM. The GUI has the same setting. |
 | `encode` | `--ecc PERCENT` | Add error correction using about this much extra space, 0-50 (default 0, off). The image can then be repaired after damage to about half that share of it. The GUI has the same setting. |
 | `encode` | `-f, --force` | Overwrite an existing output |
 | `encode` | `--no-verify` | Skip decoding the written PNG to confirm it (faster, not recommended) |
@@ -85,7 +87,8 @@ padding.
 ```
 >4s   magic          "IMST"
 B     version        2
-B     flags          0x01 zlib, 0x02 text, 0x04 folder (tar), 0x08 zero-run squeezed, 0x10 LZMA, 0x20 error correction
+B     flags          0x01 zlib, 0x02 text, 0x04 folder (tar), 0x08 zero-run squeezed, 0x10 LZMA, 0x20 error correction,
+                     0x40 zstd
 Q     original size
 Q     stored size
 32s   SHA-256 of the original bytes
@@ -94,21 +97,55 @@ H     name length
 ...   payload
 ```
 
-Encoding streams the source in 1 MiB chunks and keeps only the pixel buffer in memory.
-The payload is stored raw, zlib-compressed or LZMA-compressed, whichever is smallest; compression is
-used only when it actually makes the payload smaller. LZMA usually wins on text and source code
-(about 25% smaller than zlib on a code folder) and costs a few times the CPU of zlib. Its window is sized from the original size (the next power
-of two) and capped by `--window` (64 MiB by default), so repeats far apart in a large archive are
-still found; encoding a large folder can use around 0.5 GB of RAM at the default, decoding far
-less. The window is recorded as the first byte of an LZMA payload.
-If your Python was built without the `lzma` module (it needs the xz development files), ImageStore
-still runs: it compresses with zlib instead and reports a clear error for images that need LZMA.
+Encoding streams the source and keeps only the pixel buffer in memory. The payload is
+compressed at the chosen `--level` and stored that way only when it actually comes out smaller;
+otherwise it is stored raw. Every stage uses all cores:
 
-Folders are tarred first, and tar pads every entry to a 512-byte block, so a folder with many
-small files in nested subfolders is mostly zeros. zlib hides that, but when it is off (or does
-not win) those zeros would become empty pixels. Folder payloads are therefore also *squeezed*:
-each run of 8 or more zero bytes is replaced by its length (flag `0x08`), and whichever of
-raw, zlib, LZMA and squeezed is smallest is stored. Images made before this change still decode.
+- **`fast` and `balanced`** compress with zstd (levels 3 and 9) on every core, with long-distance
+  matching so that repeats a whole window apart, such as duplicated files, are found. zstd is
+  built into Python 3.14 and newer; `requirements.txt` installs `backports.zstd` on older
+  Pythons.
+- **`max`** compresses with LZMA (preset 6). The data is cut into window-sized blocks that are
+  compressed in parallel. Every LZMA2 stream starts with a dictionary reset, so the blocks are
+  joined without their end markers into a single ordinary LZMA2 stream, which older ImageStore
+  versions also read. Each thread needs about 11x the window in RAM, and the thread count is
+  limited to half the physical memory.
+- The window is sized from the original size (the next power of two) and capped by `--window`
+  (64 MiB by default). An LZMA payload records its window in its first byte. A decoder never
+  allows a window larger than the original size needs, so a hostile header cannot force a
+  large allocation.
+- A Python without zstd falls back to LZMA, one without `lzma` (built without the xz
+  development files) to zstd, and one with neither to zlib. The encode report says so, and an
+  image that needs a missing decompressor gets a clear error that names what to install.
+  Images stored with zlib by earlier versions still decode.
+- **Folders** are packed by a writer thread and streamed straight into the hash and the
+  compressor, so the tar is never written to disk. Folders come first, then files ordered by
+  extension and name, as 7-Zip's solid mode does, so similar files sit next to each other.
+  That makes the payload 2-6% smaller. Small files are read and duplicate
+  candidates hashed ahead of the writer on several threads.
+- **SHA-256** runs on its own thread, next to compression and decompression.
+- **The PNG** is written pigz-style: bands of rows are deflated in parallel. Each band ends with
+  a sync flush, so the bands joined behind one zlib header form a single valid stream. Data
+  that is already compressed is stored without deflating it again.
+
+Measured on 8 cores (Linux), on a 502 MB folder of 18,700 files (a virtualenv, the Python
+standard library and C headers), including verification:
+
+| | Time | Stored payload | Peak RAM |
+|---|---|---|---|
+| Before compression levels (zlib-9 and LZMA-6 on one core, keep the smaller) | 321 s | 102.4 MB | |
+| `--level fast` | 4.9 s | 135.7 MB | 0.4 GB |
+| `--level balanced` (default) | 5.3 s | 122.3 MB | 0.6 GB |
+| `--level max` | 41 s | 98.7 MB | 4.5 GB |
+
+A 1.5 GB folder of two large files (a 500 MB tar and 1 GB of random data) encodes in 7.1 s at
+`fast`, about 220 MB/s including verification.
+
+Folders are tarred, and tar pads every entry to a 512-byte block, so a folder with many
+small files in nested subfolders is mostly zeros. Compression hides that, but with
+`--no-compress` those zeros would become empty pixels. Uncompressed folder payloads are
+therefore *squeezed*: each run of 8 or more zero bytes is replaced by its length (flag `0x08`).
+Images made before any of these changes still decode.
 
 Error correction (`--ecc`) is optional and off by default. It stores Reed-Solomon parity in the
 pixels next to the data, in 255-byte blocks that are interleaved across the whole image, so a

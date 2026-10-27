@@ -69,7 +69,8 @@ under View > Theme.
 ### Flags
 
 - `-g/--gui`: open the graphical interface
-- `encode`: `-o/--output PATH`, `-t/--text TEXT`, `--no-compress`, `-f/--force`,
+- `encode`: `-o/--output PATH`, `-t/--text TEXT`, `--level fast|balanced|max`, `--no-compress`,
+  `--window MiB`, `--ecc PERCENT`, `-f/--force`,
   `--no-verify`, `--auto-ignore` / `--no-auto-ignore` (folders: skip or keep `.DS_Store`,
   `node_modules`, `__pycache__`, `.git`, `.venv` and similar; asks interactively, keeps
   everything when scripted)
@@ -81,9 +82,11 @@ a hint.
 
 ## Guarantees
 
-- The archive format, compression and SHA-256 check are unchanged from format version 2;
-  the test suite decodes archives made by the previous encoder and checks that uncompressed
-  inputs re-encode to identical pixel buffers.
+- The archive format and SHA-256 check are unchanged from format version 2, with one new
+  payload flag (`0x40`, zstd). The test suite decodes archives made by previous encoders and
+  checks that uncompressed inputs re-encode to identical pixel buffers. Images made with
+  `--level max` are plain LZMA images that earlier versions read too; zstd images need this
+  version.
 - An encode is reported as done only after the written PNG has been decoded again and its
   SHA-256 matched. It is written to a temporary file and moved into place, so a failure or
   cancel never leaves a half-written PNG.
@@ -97,7 +100,8 @@ a hint.
 - Keep the PNG pixel-exact. Lossy re-encoding, alpha premultiplication or stripping alpha
   breaks the SHA-256 check; the error message says so. Use [eXact](../eXact/README.md) to
   edit these images safely.
-- zlib or LZMA compression (whichever is smaller) is applied only when it makes the payload smaller.
+- Compression (zstd at `fast` and `balanced`, LZMA at `max`, all on every core) is kept only when it
+  makes the payload smaller. See the main README for how and how fast.
 - Error correction (`--ecc`) is off unless asked for; see the main README.
 - The digest detects corruption; it is not encryption.
 
@@ -105,7 +109,7 @@ a hint.
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests          # 115 tests, a few seconds; GUI tests skip without PyQt6
+python -m pytest tests          # about 340 tests, under half a minute; GUI tests skip without PyQt6
 QT_QPA_PLATFORM=offscreen python -m pytest tests   # headless machines
 ```
 

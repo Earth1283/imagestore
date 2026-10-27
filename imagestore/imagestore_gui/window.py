@@ -300,26 +300,43 @@ class EncodePage(Page):
         lay.addWidget(self.overwrite)
         lay.addWidget(self._divider())
         lay.addWidget(label("Options", "section"))
-        self.compress = QCheckBox("Compress first (zlib or LZMA)")
+        self.compress = QCheckBox("Compress first")
         self.compress.setChecked(self.settings.value("compress", True, type=bool))
         self.compress.toggled.connect(lambda on: self.settings.setValue("compress", on))
         lay.addWidget(self.compress)
         lay.addWidget(self._indent(label("Kept only when it makes the payload smaller; already-compressed data is "
                                          "stored raw.", "faint", wrap=True)))
+        self.level = QComboBox()
+        self.level.setAccessibleName("Compression level")
+        for name, text in (("fast", "Fast"), ("balanced", "Balanced  (default)"), ("max", "Max: smallest, slower")):
+            self.level.addItem(text, name)
+        saved_level = self.settings.value("level", core.DEFAULT_LEVEL, type=str)
+        self.level.setCurrentIndex(max(0, self.level.findData(saved_level)))
+        self.level.currentIndexChanged.connect(lambda _: self.settings.setValue("level", self.level.currentData()))
+        self.compress.toggled.connect(self.level.setEnabled)
+        self.level.setEnabled(self.compress.isChecked())
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(label("Level", "key"))
+        row.addWidget(self.level)
+        row.addStretch(1)
+        holder = QWidget()
+        holder.setLayout(row)
+        lay.addWidget(self._indent(holder))
+        lay.addWidget(self._indent(label("Fast and Balanced use zstd on every core; Max uses LZMA on every core for "
+                                         "the smallest image, several times slower.", "faint", wrap=True)))
         self.window_size = QComboBox()
-        self.window_size.setAccessibleName("LZMA window size")
+        self.window_size.setAccessibleName("Compression window size")
         for mib in WINDOW_CHOICES:
             self.window_size.addItem(f"{mib} MiB" + ("  (default)" if mib == core.LZMA_WINDOW >> 20 else ""), mib)
         saved = self.settings.value("window_mib", core.LZMA_WINDOW >> 20, type=int)
         self.window_size.setCurrentIndex(max(0, self.window_size.findData(saved)))
         self.window_size.currentIndexChanged.connect(lambda _: self.settings.setValue("window_mib", self.window_mib()))
-        self.compress.toggled.connect(lambda on: self.window_size.setEnabled(on and core.HAVE_LZMA))
-        self.window_size.setEnabled(self.compress.isChecked() and core.HAVE_LZMA)
-        if not core.HAVE_LZMA:
-            self.window_size.setToolTip("This Python was built without LZMA, so zlib is used instead.")
+        self.compress.toggled.connect(self.window_size.setEnabled)
+        self.window_size.setEnabled(self.compress.isChecked())
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
-        row.addWidget(label("LZMA window", "key"))
+        row.addWidget(label("Window", "key"))
         row.addWidget(self.window_size)
         row.addStretch(1)
         holder = QWidget()
@@ -334,9 +351,10 @@ class EncodePage(Page):
         self.ecc_note = label("", "faint", wrap=True)
         self.ecc.valueChanged.connect(self._ecc_changed)
         self._ecc_changed(self.ecc.value())
-        lay.addWidget(self._indent(label("How far back LZMA looks for repeats. A larger window can shrink big "
-                                         "folders with far-apart repeats but needs about 7× its size in RAM while "
-                                         "encoding. Small inputs never use more than they need.", "faint", wrap=True)))
+        lay.addWidget(self._indent(label("How far back compression looks for repeats. A larger window can shrink "
+                                         "big folders with far-apart repeats but needs more RAM while encoding "
+                                         "(at Max, about 11× its size per core). Small inputs never use more than "
+                                         "they need.", "faint", wrap=True)))
         ecc_row = QHBoxLayout()
         ecc_row.setContentsMargins(0, 0, 0, 0)
         ecc_row.addWidget(label("Error correction", "key"))
@@ -369,7 +387,7 @@ class EncodePage(Page):
                               f"{e.tolerance:.1%} of it. Encoding and opening take longer.")
 
     def window_mib(self) -> int:
-        """The chosen LZMA window cap in MiB."""
+        """The chosen compression window cap in MiB."""
         return self.window_size.currentData()
 
     @staticmethod
@@ -610,7 +628,8 @@ class EncodePage(Page):
         self.banner.hide()
         self.result_card.hide()
         self.progress.begin()
-        common = dict(compress=self.compress.isChecked(), window=self.window_mib() << 20, ecc=self.ecc.value(), force=self.overwrite.isChecked(),
+        common = dict(compress=self.compress.isChecked(), level=self.level.currentData(), window=self.window_mib() << 20,
+                      ecc=self.ecc.value(), force=self.overwrite.isChecked(),
                       verify=self.verify.isChecked())
         if self.kind.value() == "text":
             self.runner.start(core.encode_text, self.text.toPlainText(), out, **common)
@@ -1002,7 +1021,7 @@ class InspectPage(Page):
             if m.ecc:
                 text, tone = core.ecc_summary(m.ecc)
                 g.add("Error correction", text, tone=tone or None)
-            flags = [n for f, n in ((core.FLAG_ZLIB, "zlib"), (core.FLAG_LZMA, "lzma"), (core.FLAG_TEXT, "text"), (core.FLAG_DIR, "folder"),
+            flags = [n for f, n in ((core.FLAG_ZLIB, "zlib"), (core.FLAG_LZMA, "lzma"), (core.FLAG_ZSTD, "zstd"), (core.FLAG_TEXT, "text"), (core.FLAG_DIR, "folder"),
                                       (core.FLAG_SQUEEZE, "squeezed"), (core.FLAG_ECC, "ecc"))
                      if m.flags & f]
             g.add("Format", f"ImageStore v{core.VERSION} · flags 0x{m.flags:02x}"

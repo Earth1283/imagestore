@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import random
 import tarfile
 
 import pytest
 
+import imagestore
 from imagestore import ImageStoreError
+
+needs_zstd = pytest.mark.skipif(not imagestore.HAVE_ZSTD, reason="needs Python 3.14+ or backports.zstd")
 
 COMPRESSIBLE_200K = b"abcdefgh" * (200 * 1024 // 8)  # 204800 bytes of repeats
 RANDOM_300K = random.Random(300).randbytes(300 * 1024)
@@ -309,9 +313,11 @@ def _nested_tree(root, rand_bytes):
 
 
 def _empty_pixel_fraction(png) -> float:
+    """Share of all-zero pixels before the padding that squares off the image (less than a row,
+    and a larger share of a small image than this test is about)."""
     from PIL import Image
     with Image.open(png) as im:
-        buf = im.tobytes()
+        buf = im.tobytes().rstrip(b"\0")
     zero = sum(buf[i:i + 4] == b"\0\0\0\0" for i in range(0, len(buf), 4))
     return zero / (len(buf) // 4)
 
@@ -407,7 +413,7 @@ def test_lzma_beats_zlib_on_text_and_round_trips(istore, tmp_path):
     src = _write(tmp_path / "t.txt", data)
     png = tmp_path / "t.png"
 
-    res = istore.encode_path(src, png)
+    res = istore.encode_path(src, png, level="max")
 
     assert res.meta.method == "lzma"
     assert res.meta.stored_size < len(zlib.compress(data, 9))
@@ -565,7 +571,7 @@ def test_lzma_window_covers_repeats_far_apart(istore, tmp_path, rand_bytes):
     block = rand_bytes(700_000, seed=3)
     src = _write(tmp_path / "r.bin", block + rand_bytes(700_000, seed=4) + block)  # repeat is 1.4 MB away
 
-    res = istore.encode_path(src, tmp_path / "r.png")
+    res = istore.encode_path(src, tmp_path / "r.png", level="max")
 
     assert res.meta.method == "lzma" and res.meta.stored_size < 1_500_000
     assert istore.decode_path(tmp_path / "r.png", tmp_path / "out").out.read_bytes() == src.read_bytes()
@@ -589,7 +595,7 @@ def test_smaller_window_trades_size_for_memory_and_still_decodes(istore, tmp_pat
 
 def test_lzma_payload_records_its_window(istore, tmp_path, rand_bytes):
     src = _far_repeat(tmp_path, rand_bytes)
-    img, meta = istore.encode(src.open("rb"), "f.bin", True, 0, window=1 << 20)
+    img, meta = istore.encode(src.open("rb"), "f.bin", True, 0, window=1 << 20, level="max")
     px = istore._Pixels(img)
     px.read(istore.HEADER.size + len(meta.name.encode()))
     assert meta.method == "lzma" and px.read(1)[0] == 20
@@ -629,17 +635,19 @@ def test_window_defaults_to_64_mib(istore):
 
 # ---------------------------------------------------- a Python built without lzma
 
-def test_encode_falls_back_to_zlib_without_lzma(istore, tmp_path, monkeypatch):
+def test_encode_falls_back_to_zlib_without_lzma_or_zstd(istore, tmp_path, monkeypatch):
     monkeypatch.setattr(istore, "lzma", None)
+    monkeypatch.setattr(istore, "zstd", None)
     src = _write(tmp_path / "t.txt", _text_blob())
-    res = istore.encode_path(src, tmp_path / "t.png")
+    res = istore.encode_path(src, tmp_path / "t.png", level="max")
     assert res.meta.method == "zlib"
+    assert "zlib was used" in istore.fallback_note("max")
     assert istore.decode_path(tmp_path / "t.png", tmp_path / "out").out.read_bytes() == src.read_bytes()
 
 
 def test_reading_an_lzma_image_without_lzma_explains_itself(istore, tmp_path, monkeypatch):
     src = _write(tmp_path / "t.txt", _text_blob())
-    istore.encode_path(src, tmp_path / "t.png")
+    istore.encode_path(src, tmp_path / "t.png", level="max")
     monkeypatch.setattr(istore, "lzma", None)
     with pytest.raises(ImageStoreError) as ei:
         istore.decode_path(tmp_path / "t.png", tmp_path / "out")
@@ -652,9 +660,9 @@ def test_the_tool_starts_and_works_with_the_lzma_import_blocked(istore, tmp_path
     import subprocess
     import sys
     script = (
-        "import sys; sys.modules['lzma'] = None\n"
+        "import sys; sys.modules['lzma'] = sys.modules['compression.zstd'] = sys.modules['backports.zstd'] = None\n"
         "import imagestore as m, pathlib\n"
-        "assert not m.HAVE_LZMA\n"
+        "assert not m.HAVE_LZMA and not m.HAVE_ZSTD\n"
         f"src = pathlib.Path({str(tmp_path)!r}) / 'a.txt'; src.write_text('hello ' * 4000)\n"
         "res = m.encode_path(src, src.with_suffix('.png'))\n"
         "assert res.meta.method == 'zlib', res.meta.method\n"
@@ -664,3 +672,217 @@ def test_the_tool_starts_and_works_with_the_lzma_import_blocked(istore, tmp_path
     done = subprocess.run([sys.executable, "-c", script], cwd=istore.__file__.rsplit("/", 1)[0],
                           capture_output=True, text=True)
     assert done.returncode == 0, done.stderr
+
+
+# ------------------------------------------------------------- levels, zstd, parallel LZMA
+
+@pytest.mark.parametrize("level,method", [pytest.param("fast", "zstd", marks=needs_zstd),
+                                          pytest.param("balanced", "zstd", marks=needs_zstd), ("max", "lzma")])
+def test_each_level_round_trips_with_its_method(istore, tmp_path, level, method):
+    data = _text_blob()
+    src = _write(tmp_path / "t.txt", data)
+    res = istore.encode_path(src, tmp_path / "t.png", level=level)
+    assert res.meta.method == method and res.level == level
+    assert res.meta.stored_size < len(data) // 2
+    assert istore.decode_path(tmp_path / "t.png", tmp_path / "out").out.read_bytes() == data
+
+
+@needs_zstd
+def test_default_level_is_balanced_zstd(istore, tmp_path):
+    src = _write(tmp_path / "t.txt", _text_blob())
+    assert istore.encode_path(src, tmp_path / "t.png").meta.method == "zstd"
+    assert istore.build_parser().parse_args(["encode", "x"]).level == "balanced"
+
+
+def test_level_option_rejects_unknown_names(istore, capsys):
+    with pytest.raises(SystemExit):
+        istore.build_parser().parse_args(["encode", "x", "--level", "ludicrous"])
+
+
+def test_parallel_lzma_blocks_join_into_one_stream_an_old_decoder_reads(istore, tmp_path, monkeypatch):
+    import lzma
+    monkeypatch.setattr(istore, "WORKERS", 4)
+    data = _text_blob()  # ~1 MB in 64 KiB windows: 16+ blocks compressed on 4 threads
+    window = 64 << 10
+    img, meta = istore.encode(io.BytesIO(data), "t.txt", True, 0, window=window, level="max")
+    assert meta.method == "lzma"
+    px = istore._Pixels(img)
+    px.read(istore.HEADER.size + len(meta.name.encode()))
+    payload = bytes(px.read(meta.stored_size))
+    assert payload[0] == window.bit_length() - 1
+    # a single plain LZMA2 decoder, as every earlier ImageStore version uses
+    d = lzma.LZMADecompressor(lzma.FORMAT_RAW, filters=istore.lzma_filters(window))
+    assert d.decompress(payload[1:]) == data and d.eof
+
+
+def test_parallel_lzma_matches_one_thread(istore, monkeypatch):
+    data = _text_blob()[:400_000]
+    sizes = {}
+    for workers in (1, 3):
+        monkeypatch.setattr(istore, "WORKERS", workers)
+        c = istore._Compressor("lzma", "max", len(data), 32 << 10)
+        try:
+            for i in range(0, len(data), 7777):  # chunks that never line up with blocks
+                c.write(data[i:i + 7777])
+            c.finish()
+            c.spool.seek(0)
+            sizes[workers] = c.spool.read()
+        finally:
+            c.close()
+    assert sizes[1] == sizes[3]
+
+
+def test_empty_input_round_trips_at_every_level(istore, tmp_path):
+    src = _write(tmp_path / "e.bin", b"")
+    for level in istore.LEVELS:
+        png = tmp_path / f"{level}.png"
+        istore.encode_path(src, png, level=level)
+        assert istore.decode_path(png, tmp_path / level).out.read_bytes() == b""
+
+
+@needs_zstd
+def test_reading_a_zstd_image_without_zstd_explains_itself(istore, tmp_path, monkeypatch):
+    src = _write(tmp_path / "t.txt", _text_blob())
+    istore.encode_path(src, tmp_path / "t.png")
+    monkeypatch.setattr(istore, "zstd", None)
+    with pytest.raises(ImageStoreError) as ei:
+        istore.decode_path(tmp_path / "t.png", tmp_path / "out")
+    assert ei.value.kind == "no_zstd"
+    assert not (tmp_path / "out").exists()
+    assert "backports.zstd" in istore.explain(ei.value).hint
+
+
+def test_without_zstd_fast_levels_use_lzma_and_say_so(istore, tmp_path, monkeypatch):
+    monkeypatch.setattr(istore, "zstd", None)
+    src = _write(tmp_path / "t.txt", _text_blob())
+    res = istore.encode_path(src, tmp_path / "t.png", level="fast")
+    assert res.meta.method == "lzma"
+    assert "backports.zstd" in istore.fallback_note("fast")
+    assert istore.decode_path(tmp_path / "t.png", tmp_path / "out").out.read_bytes() == src.read_bytes()
+
+
+@needs_zstd
+def test_hostile_zstd_window_cannot_force_a_big_allocation(istore):
+    zstd = istore.zstd
+    P = zstd.CompressionParameter
+    co = zstd.ZstdCompressor(options={P.window_log: 27})
+    frame = co.compress(bytes(range(256)) * 800) + co.flush()  # streamed: the frame asks for a 128 MiB window
+    with pytest.raises(ImageStoreError) as ei:
+        b"".join(istore._unzstd(iter([frame]), 1000))  # the header claims 1000 bytes
+    assert ei.value.kind == "zlib"
+
+
+@needs_zstd
+def test_zstd_survives_arbitrary_chunk_boundaries(istore, tmp_path):
+    data = _text_blob()[:300_000]
+    img, meta = istore.encode(io.BytesIO(data), "t.txt", True, 0)
+    px = istore._Pixels(img)
+    px.read(istore.HEADER.size + len(meta.name.encode()))
+    payload = bytes(px.read(meta.stored_size))
+    rng = random.Random(9)
+    cuts = sorted(rng.sample(range(len(payload)), 30))
+    pieces = [payload[a:b] for a, b in zip([0] + cuts, cuts + [len(payload)])]
+    assert b"".join(istore._unzstd(iter(pieces), len(data))) == data
+
+
+def test_folder_tar_groups_files_by_extension(istore, tmp_path):
+    import tarfile
+    proj = tmp_path / "proj"
+    for rel in ("z/b.txt", "a/a.py", "c.txt", "m/n/d.py", "README"):
+        _write(proj / rel, rel.encode() * 10)
+    tar, files = istore.pack_dir(proj)
+    tar.seek(0)
+    with tarfile.open(fileobj=tar) as t:
+        names = [m.name for m in t.getmembers()]
+    tar.close()
+    assert files == 5
+    assert names == ["proj", "proj/a", "proj/m", "proj/m/n", "proj/z",  # folders first, parents before children
+                     "proj/README", "proj/a/a.py", "proj/m/n/d.py", "proj/z/b.txt", "proj/c.txt"]
+
+
+def test_hard_links_on_disk_are_stored_after_their_target(istore, tmp_path, regular_files):
+    proj = tmp_path / "proj"
+    _write(proj / "a" / "late.txt", b"same bytes " * 500)
+    os.link(proj / "a" / "late.txt", proj / "early.py")  # sorts before the file it was linked from
+    png = tmp_path / "p.png"
+    res = istore.encode_path(proj, png)
+    assert res.duplicates == 1
+    out = tmp_path / "out"
+    istore.decode_path(png, out)
+    assert regular_files(out / "proj") == regular_files(proj)
+
+
+# ---------------------------------------------------------------------- PNG writer
+
+def _idat_stream(png: bytes) -> bytes:
+    import struct
+    import zlib
+    pos, idat = 8, []
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    while pos < len(png):
+        n, kind = struct.unpack(">I4s", png[pos:pos + 8])
+        data = png[pos + 8:pos + 8 + n]
+        assert struct.unpack(">I", png[pos + 8 + n:pos + 12 + n])[0] == zlib.crc32(data, zlib.crc32(kind))
+        if kind == b"IDAT":
+            idat.append(data)
+        pos += 12 + n
+    return b"".join(idat)
+
+
+@pytest.mark.parametrize("level", [0, 1])
+@pytest.mark.parametrize("width,height,band", [(1, 1, 4 << 20), (37, 53, 1000), (300, 211, 5000), (64, 64, 1)])
+def test_parallel_png_is_one_valid_zlib_stream_pillow_reads(istore, tmp_path, monkeypatch, width, height, band, level):
+    import zlib
+    from PIL import Image
+    monkeypatch.setattr(istore, "WORKERS", 3)
+    monkeypatch.setattr(istore, "PNG_BAND", band)  # many bands, so many joins
+    buf = bytearray(random.Random(width).randbytes(width * height * 4))
+    png = tmp_path / "p.png"
+    istore.write_png(png, buf, width, height, level=level)
+
+    raw = zlib.decompress(_idat_stream(png.read_bytes()))  # checks the combined Adler-32 too
+    stride = width * 4
+    assert raw == b"".join(b"\0" + bytes(buf[y * stride:(y + 1) * stride]) for y in range(height))
+    with Image.open(png) as im:
+        assert im.mode == "RGBA" and im.size == (width, height) and im.tobytes() == bytes(buf)
+
+
+def test_adler32_combine_matches_zlib(istore):
+    import zlib
+    rng = random.Random(4)
+    for _ in range(200):
+        a, b = rng.randbytes(rng.randint(0, 3000)), rng.randbytes(rng.choice([0, 1, 65521, 65522, rng.randint(0, 200_000)]))
+        assert istore._adler32_combine(zlib.adler32(a), zlib.adler32(b), len(b)) == zlib.adler32(a + b)
+
+
+def test_folder_falls_back_to_a_plain_tar_when_that_is_smallest(istore, tmp_path, rand_bytes, regular_files,
+                                                                monkeypatch):
+    proj = tmp_path / "proj"
+    files = _nested_tree(proj, rand_bytes)
+    monkeypatch.setattr(istore, "squeeze", lambda chunk: bytes(chunk) + b"bloat")  # never smaller
+    labels = []
+    task = istore.Task(lambda label, done, total: labels.append(label))
+    res = istore.encode_path(proj, tmp_path / "p.png", compress=False, task=task)
+    assert res.meta.method == "raw" and res.meta.is_dir and res.files == len(files)
+    assert labels.count("Packing folder") >= 2  # streamed once, then packed again into scratch space
+    istore.decode_path(tmp_path / "p.png", tmp_path / "out")
+    assert regular_files(tmp_path / "out" / "proj") == files
+
+
+def test_folder_encode_reports_an_unreadable_file_and_stops_its_writer(istore, tmp_path, monkeypatch):
+    import threading
+    proj = tmp_path / "proj"
+    _write(proj / "a.txt", b"x" * 5000)
+    _write(proj / "b.txt", b"y" * 5000)
+    real = istore._prefetch
+
+    def deny(name, size, hash_it):
+        if name.endswith("b.txt"):
+            raise PermissionError(13, "Permission denied", name)
+        return real(name, size, hash_it)
+
+    monkeypatch.setattr(istore, "_prefetch", deny)
+    with pytest.raises(PermissionError):
+        istore.encode_path(proj, tmp_path / "p.png")
+    assert not (tmp_path / "p.png").exists()
+    assert not [t for t in threading.enumerate() if t.name == "imagestore-tar"]
